@@ -9,10 +9,28 @@ description = "Sovereign AI Worker Platform — a local-first AI employee for bu
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
+# Core is intentionally dependency-free. Optional capabilities are opt-in extras
+# so the runtime never pulls a third-party package unless the operator asks for
+# the feature (mirrors the fail-closed graceful-degradation design in SECURITY.md).
 dependencies = []
+
+[project.optional-dependencies]
+# Encrypted-at-rest secrets (sworker/secrets.py) — AES-GCM.
+secrets = ["cryptography>=42"]
+# PDF / DOCX ingestion (sworker/knowledge.py). JSON path is stdlib, always on.
+ingest-pdf = ["pdfminer.six>=20221105"]
+ingest-docx = ["python-docx>=1.1"]
+# Company knowledge compiler (sworker/knowledge.py) — Hermes Atlas.
+atlas = ["hermes-atlas"]
+# Everything optional, for a full-featured install.
+all = ["cryptography>=42", "pdfminer.six>=20221105", "python-docx>=1.1", "hermes-atlas"]
 
 [project.scripts]
 sworker = "sworker.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kliewerdaniel/sovereign-worker"
+Repository = "https://github.com/kliewerdaniel/sovereign-worker"
 
 [tool.setuptools]
 packages = ["sworker", "sworker.tools"]

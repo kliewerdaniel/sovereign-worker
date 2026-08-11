@@ -132,7 +132,292 @@ def test_path_escaping_blocked(ws):
     assert res.status is VerificationOutcome.UNVERIFIABLE
 
 
-# ---------------------------------------------------------------------------
+# --- §7 verification hardening ------------------------------------------------
+
+def test_provenance_chain_pass(ws):
+    # write a report artifact that cites the derived figure
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write("# Q2 revenue\n\nQ2 revenue was 188,500.00 across regions.\n")
+    spec = {
+        "check": "provenance_chain",
+        "path": "company/sales.csv",
+        "value_column": "revenue",
+        "where": {"quarter": "Q2"},
+        "expect": 188500.0,
+        "artifact": "company/report.md",
+    }
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.PASS, res.detail
+
+
+def test_provenance_chain_fails_when_artifact_does_not_cite(ws):
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write("# Q2 revenue\n\nThe numbers are fine (trust me).\n")
+    spec = {
+        "check": "provenance_chain",
+        "path": "company/sales.csv",
+        "value_column": "revenue",
+        "where": {"quarter": "Q2"},
+        "expect": 188500.0,
+        "artifact": "company/report.md",
+    }
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.FAIL, res.detail
+    assert "DOES NOT cite" in res.detail
+
+
+def test_provenance_chain_fails_when_source_mismatch(ws):
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write("Q2 revenue was 999.00.\n")
+    spec = {
+        "check": "provenance_chain",
+        "path": "company/sales.csv",
+        "value_column": "revenue",
+        "where": {"quarter": "Q2"},
+        "expect": 188500.0,
+        "artifact": "company/report.md",
+    }
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.FAIL, res.detail
+
+
+def test_finalize_fails_closed_on_unverifiable(ws):
+    """§7: a run that produced an UNVERIFIABLE verification must not be SUCCESS."""
+    from sworker.config import get_worker
+    from sworker.engine import WorkerEngine
+    from sworker.evidence import EvidenceLedger
+    from sworker.models import Run, Verification, Evidence, Provenance, now
+
+    worker = get_worker("acme-analyst", ws)
+    store = WorkerStore(ws.state_dir)
+    eng = WorkerEngine(worker, store)
+    run = Run(worker=worker.name, task_id="t1", verifications=[{"check": "nope"}])
+    run.status = RunStatus.EXECUTING
+    store.put("runs", run, event="run.started")
+    # evidence present so it would otherwise be SUCCESS
+    ev = Evidence(run_id=run.id, provenance=Provenance.OBSERVED, summary="saw rows")
+    store.put("evidence", ev, event="evidence.recorded")
+    # an UNVERIFIABLE verification (unknown check) recorded for the run
+    v = Verification(run_id=run.id, claim_id="", check="nope", outcome=VerificationOutcome.UNVERIFIABLE,
+                    detail="unknown check")
+    store.put("verifications", v, event="verification.recorded")
+    ledger = EvidenceLedger(store, run.id)
+    res = eng._finalize(run, ledger, failures=0, executed=1, blocked=False,
+                        awaiting=False, on_event=lambda e, p: None)
+    assert res.status is RunStatus.PARTIAL_SUCCESS, res.summary
+    assert "could not be proven" in (run.error or "")
+
+
+def test_finalize_success_when_all_verifications_pass(ws):
+    from sworker.config import get_worker
+    from sworker.engine import WorkerEngine
+    from sworker.evidence import EvidenceLedger
+    from sworker.models import Run, Verification, Evidence, Provenance
+
+    worker = get_worker("acme-analyst", ws)
+    store = WorkerStore(ws.state_dir)
+    eng = WorkerEngine(worker, store)
+    run = Run(worker=worker.name, task_id="t2", verifications=[{"check": "recompute_sum"}])
+    run.status = RunStatus.EXECUTING
+    store.put("runs", run, event="run.started")
+    ev = Evidence(run_id=run.id, provenance=Provenance.OBSERVED, summary="saw rows")
+    store.put("evidence", ev, event="evidence.recorded")
+    v = Verification(run_id=run.id, claim_id="", check="recompute_sum", outcome=VerificationOutcome.PASS,
+                    detail="ok")
+    store.put("verifications", v, event="verification.recorded")
+    ledger = EvidenceLedger(store, run.id)
+    res = eng._finalize(run, ledger, failures=0, executed=1, blocked=False,
+                        awaiting=False, on_event=lambda e, p: None)
+    assert res.status is RunStatus.SUCCESS, res.summary
+
+
+# --- §15 generalized verification framework -----------------------------------
+
+
+def test_schema_pass(ws):
+    spec = {"check": "schema", "path": "company/sales.csv",
+            "required_columns": ["region", "quarter", "revenue", "orders"]}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.PASS, res.detail
+
+
+def test_schema_fail_missing_column(ws):
+    spec = {"check": "schema", "path": "company/sales.csv",
+            "required_columns": ["region", "quarter", "revenue", "orders", "missing_col"]}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.FAIL, res.detail
+    assert "missing_col" in res.detail
+
+
+def test_schema_fail_type_violation(ws):
+    # write a CSV where 'orders' is non-numeric in one row
+    bad = ws.root + "/company/bad.csv"
+    with open(bad, "w") as f:
+        f.write("region,quarter,revenue,orders\nNorth,Q2,51000,not_a_number\n")
+    spec = {"check": "schema", "path": "company/bad.csv",
+            "required_columns": ["region", "orders"], "column_types": {"orders": "int"}}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.FAIL, res.detail
+
+
+def test_schema_unverifiable_missing_source(ws):
+    spec = {"check": "schema", "path": "company/nope.csv",
+            "required_columns": ["x"]}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.UNVERIFIABLE
+
+
+def test_set_equality_pass(ws):
+    spec = {"check": "set_equality", "path": "company/sales.csv", "value_column": "region",
+            "expected": ["North", "Online", "South"]}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.PASS, res.detail
+    assert res.actual == ["North", "Online", "South"]
+
+
+def test_set_equality_fail_extra_region(ws):
+    spec = {"check": "set_equality", "path": "company/sales.csv", "value_column": "region",
+            "expected": ["North", "South"]}  # missing Online
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.FAIL, res.detail
+
+
+def test_set_equality_unverifiable_without_expected(ws):
+    spec = {"check": "set_equality", "path": "company/sales.csv", "value_column": "region"}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.UNVERIFIABLE
+
+
+def test_regex_present_pass(ws):
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write("Order ORD-2026-0042 shipped.\n")
+    spec = {"check": "regex", "path": "company/report.md", "pattern": r"ORD-\d{4}-\d{4}"}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.PASS, res.detail
+
+
+def test_regex_absent_fail(ws):
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write("No order id here.\n")
+    spec = {"check": "regex", "path": "company/report.md", "pattern": r"ORD-\d{4}-\d{4}"}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.FAIL, res.detail
+
+
+def test_regex_want_absence_pass(ws):
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write("Clean file.\n")
+    spec = {"check": "regex", "path": "company/report.md",
+            "pattern": r"SECRET", "present": False}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.PASS, res.detail
+
+
+def test_doc_section_contains_pass(ws):
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write("# Methodology\n\nFigures were summed from the CSV.\n\n# Notes\n\nEnd.\n")
+    spec = {"check": "doc_section", "path": "company/report.md",
+            "heading": "# Methodology", "contains": "summed from the CSV"}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.PASS, res.detail
+
+
+def test_doc_section_contains_fail(ws):
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write("# Methodology\n\nFigures were guessed.\n")
+    spec = {"check": "doc_section", "path": "company/report.md",
+            "heading": "# Methodology", "contains": "summed from the CSV"}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.FAIL, res.detail
+    assert "DOES NOT contain" in res.detail
+
+
+def test_doc_section_missing_heading_fail(ws):
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write("# Other\n\nx\n")
+    spec = {"check": "doc_section", "path": "company/report.md",
+            "heading": "# Methodology", "contains": "x"}
+    res = run_check(spec, ws.root)
+    assert res.status is VerificationOutcome.FAIL, res.detail
+
+
+# --- §16 claim-level provenance + artifact claim exposure ---------------------
+
+
+def test_finalize_partial_success_when_artifact_surfaces_unbacked_claim(ws):
+    """§16: an artifact that states a claim with NO provenance cannot be SUCCESS."""
+    from sworker.config import get_worker
+    from sworker.engine import WorkerEngine
+    from sworker.evidence import EvidenceLedger
+    from sworker.models import Run, Evidence, Provenance, Claim
+
+    worker = get_worker("acme-analyst", ws)
+    store = WorkerStore(ws.state_dir)
+    eng = WorkerEngine(worker, store)
+    run = Run(worker=worker.name, task_id="t16a")
+    run.status = RunStatus.EXECUTING
+    store.put("runs", run, event="run.started")
+    # evidence exists so it would otherwise be SUCCESS
+    ev = Evidence(run_id=run.id, provenance=Provenance.OBSERVED, summary="saw rows")
+    store.put("evidence", ev, event="evidence.recorded")
+    # a claim with no evidence/verification link
+    c = Claim(run_id=run.id, text="Q2 revenue was 188,500.00", provenance=Provenance.HYPOTHESIZED)
+    store.put("claims", c, event="claim.recorded")
+    # artifact surfaces the claim text
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write(f"# Report\n\n{c.text}\n")
+    a = {
+        "id": "art_test16", "run_id": run.id, "path": art, "kind": "markdown",
+        "bytes": os.path.getsize(art), "claim_ids": [c.id],
+    }
+    store.put("artifacts", a, event="artifact.created")
+    ledger = EvidenceLedger(store, run.id)
+    res = eng._finalize(run, ledger, failures=0, executed=1, blocked=False,
+                        awaiting=False, on_event=lambda e, p: None)
+    assert res.status is RunStatus.PARTIAL_SUCCESS, res.summary
+    assert "no provenance" in (run.error or "")
+
+
+def test_finalize_success_when_surfaced_claim_is_backed(ws):
+    """§16: a surfaced claim linked to evidence clears the bar -> SUCCESS."""
+    from sworker.config import get_worker
+    from sworker.engine import WorkerEngine
+    from sworker.evidence import EvidenceLedger
+    from sworker.models import Run, Evidence, Provenance, Claim
+
+    worker = get_worker("acme-analyst", ws)
+    store = WorkerStore(ws.state_dir)
+    eng = WorkerEngine(worker, store)
+    run = Run(worker=worker.name, task_id="t16b")
+    run.status = RunStatus.EXECUTING
+    store.put("runs", run, event="run.started")
+    ev = Evidence(run_id=run.id, provenance=Provenance.OBSERVED, summary="saw rows")
+    store.put("evidence", ev, event="evidence.recorded")
+    c = Claim(run_id=run.id, text="Q2 revenue was 188,500.00", provenance=Provenance.OBSERVED,
+              evidence_ids=[ev.id])
+    store.put("claims", c, event="claim.recorded")
+    art = os.path.join(ws.root, "company", "report.md")
+    with open(art, "w") as f:
+        f.write(f"# Report\n\n{c.text}\n")
+    a = {
+        "id": "art_test16b", "run_id": run.id, "path": art, "kind": "markdown",
+        "bytes": os.path.getsize(art), "claim_ids": [c.id],
+    }
+    store.put("artifacts", a, event="artifact.created")
+    ledger = EvidenceLedger(store, run.id)
+    res = eng._finalize(run, ledger, failures=0, executed=1, blocked=False,
+                        awaiting=False, on_event=lambda e, p: None)
+    assert res.status is RunStatus.SUCCESS, res.summary
 # scheduler
 # ---------------------------------------------------------------------------
 

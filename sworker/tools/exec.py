@@ -1,10 +1,16 @@
 """Shell + Python execution.
 
-Honest security note: these run as SUBPROCESSES on the host, not in a VM. The
-boundaries enforced are real but shallow — see docs/SECURITY.md (section 2) for
-the full model and its limits, including why you should set ``sandbox: docker``
-on a worker for genuine isolation rather than relying on these controls as a
-security boundary.
+Honest security note: by default these run as SUBPROCESSES on the host (sandbox
+``none``), not in a VM. The boundaries enforced are real but shallow — see
+docs/SECURITY.md (section 2). For genuine isolation set ``sandbox: docker`` on a
+worker; the §9 ``Sandbox`` abstraction will run the command in a container and, if
+docker is unavailable, FAIL CLOSED rather than silently downgrading to host
+execution.
+
+Both tools route through :mod:`sworker.tools.sandbox`, which is the single place
+that owns the isolation boundary (env allow-list, fs boundary via cwd, timeout,
+process-group kill). The tools only do *policy* (which command/argv is allowed);
+the sandbox owns *isolation*.
 """
 
 from __future__ import annotations
@@ -12,60 +18,21 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import subprocess
 import sys
 import tempfile
-import time
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from ..models import RiskLevel
-from .base import Tool, ToolContext, ToolError, ToolResult, truncate
-
-
-def _run_argv(argv: List[str], ctx: ToolContext, timeout: int) -> ToolResult:
-    t0 = time.time()
-    try:
-        proc = subprocess.run(
-            argv,
-            cwd=ctx.workspace,
-            env=ctx.clean_env(),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            shell=False,
-        )
-    except FileNotFoundError:
-        return ToolResult(False, error=f"command not found: {argv[0]}")
-    except subprocess.TimeoutExpired:
-        return ToolResult(
-            False,
-            error=f"timed out after {timeout}s",
-            data={"timeout": True, "argv": argv},
-        )
-    out, t1 = truncate(proc.stdout, ctx.max_output)
-    err, t2 = truncate(proc.stderr, ctx.max_output)
-    ok = proc.returncode == 0
-    combined = out if not err else f"{out}\n[stderr]\n{err}"
-    return ToolResult(
-        ok,
-        output=combined.strip(),
-        error="" if ok else f"exit {proc.returncode}: {err.strip()[:500]}",
-        truncated=t1 or t2,
-        data={
-            "argv": argv,
-            "exit_code": proc.returncode,
-            "stdout": out,
-            "stderr": err,
-            "duration_ms": int((time.time() - t0) * 1000),
-        },
-    )
+from .base import Tool, ToolContext, ToolError, ToolResult
+from .sandbox import SandboxError, run_in_sandbox
 
 
 class ShellExec(Tool):
     name = "shell.exec"
     description = (
         "Run an allowlisted command. Parsed with shlex and executed WITHOUT a shell, "
-        "so pipes/redirection/globs are not interpreted."
+        "so pipes/redirection/globs are not interpreted. Runs inside the worker's "
+        "configured sandbox (default: host subprocess)."
     )
     risk = RiskLevel.REVERSIBLE
     permissions = ["subprocess"]
@@ -97,16 +64,16 @@ class ShellExec(Tool):
             raise ToolError(
                 f"command {base!r} is not in this worker's shell_allow list {ctx.shell_allow}"
             )
-        timeout = min(int(args.get("timeout", 30)), 300)
-        return _run_argv(argv, ctx, timeout)
+        timeout = min(int(args.get("timeout", 30)), min(300, ctx.max_shell_runtime))
+        return run_in_sandbox(argv, ctx, timeout)
 
 
 class PythonAnalysis(Tool):
     name = "python.run"
     description = (
-        "Run a Python analysis script in the workspace. The script may print a line "
-        "starting with 'RESULT_JSON:' followed by a JSON object; that object is captured "
-        "as structured output and becomes machine-checkable evidence."
+        "Run a Python analysis script in the worker's sandbox. The script may print a "
+        "line starting with 'RESULT_JSON:' followed by a JSON object; that object is "
+        "captured as structured output and becomes machine-checkable evidence."
     )
     risk = RiskLevel.REVERSIBLE
     permissions = ["subprocess"]
@@ -129,8 +96,8 @@ class PythonAnalysis(Tool):
         fd, path = tempfile.mkstemp(suffix=".py", dir=scripts, prefix=f"{ctx.run_id}_")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(args["code"])
-        timeout = min(int(args.get("timeout", 60)), 300)
-        res = _run_argv([sys.executable, path], ctx, timeout)
+        timeout = min(int(args.get("timeout", 60)), min(300, ctx.max_python_runtime))
+        res = run_in_sandbox([sys.executable, path], ctx, timeout)
         structured = None
         for line in (res.data.get("stdout") or "").splitlines():
             if line.startswith("RESULT_JSON:"):
@@ -139,6 +106,7 @@ class PythonAnalysis(Tool):
                 except json.JSONDecodeError:
                     structured = None
         res.data["script"] = path
+        res.data["sandbox"] = res.data.get("sandbox", ctx.sandbox)
         if structured is not None:
             res.data["result"] = structured
             res.evidence.append(

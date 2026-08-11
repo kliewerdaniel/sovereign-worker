@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 import sys
+import json
+import time
 import textwrap
 from pathlib import Path
 
@@ -161,3 +163,300 @@ def test_knowledge_explain_handles_missing_claim(ws):
     res = KnowledgeExplain().run(ctx, {"claim_id": "does-not-exist"})
     assert res.ok is False
     assert "does-not-exist" in res.error
+
+
+# ---------------------------------------------------------------------------
+# §17 Atlas deepening — status / stale / rebuild / incremental (real Atlas)
+# ---------------------------------------------------------------------------
+# These run against the real hermes_atlas checkout, which is importable in this
+# dev environment. If Atlas is ever unavailable they skip rather than fake a pass.
+
+
+@pytest.fixture()
+def atlas_ws(tmp_path):
+    """A real workspace with a company corpus and a compiled Atlas index."""
+    import sworker.knowledge as K
+
+    if not K.atlas_status()["available"]:
+        pytest.skip("hermes_atlas not importable; §17 live tests need it")
+    home = tmp_path / "acme"
+    (home / "company").mkdir(parents=True)
+    (home / "workers").mkdir(parents=True)
+    src = home / "company" / "pricing.md"
+    src.write_text(
+        "# Acme Pricing Policy\n\n"
+        "We grant a 10% volume discount to partners ordering above 500 units.\n"
+        "Free shipping applies only to repeat customers.\n"
+    )
+    w = Workspace(str(home))
+    w.ensure()
+    rep = K.incremental_compile([str(w.company_dir)], w.atlas_dir)
+    assert rep.get("ok"), rep
+    return w
+
+
+def test_atlas_status_current_after_compile(atlas_ws):
+    from sworker import knowledge as K
+
+    st = K.atlas_index_status(atlas_ws.atlas_dir)
+    assert st["compiled"] is True
+    assert st["sources"] >= 1
+    assert st["fingerprint"]
+    assert st["stale_count"] == 0
+    assert st["missing_count"] == 0
+
+
+def test_atlas_status_detects_stale_edit(atlas_ws):
+    """Editing a source after compile is detected as STALE (checksum mismatch)."""
+    from sworker import knowledge as K
+
+    src = os.path.join(atlas_ws.company_dir, "pricing.md")
+    open(src, "w").write(
+        "# Acme Pricing Policy\n\n"
+        "We grant a 20% volume discount to partners ordering above 250 units.\n"
+    )
+    st = K.atlas_index_status(atlas_ws.atlas_dir)
+    assert st["stale_count"] == 1, st
+    s = st["stale"][0]
+    assert s["path"].endswith("pricing.md")
+    assert s["recorded_checksum"] != s["live_checksum"]
+
+
+def test_atlas_status_detects_missing_source(atlas_ws):
+    """Deleting a source after compile is detected as MISSING."""
+    from sworker import knowledge as K
+
+    src = os.path.join(atlas_ws.company_dir, "pricing.md")
+    os.unlink(src)
+    st = K.atlas_index_status(atlas_ws.atlas_dir)
+    assert st["missing_count"] == 1, st
+    assert st["missing_sources"][0]["path"].endswith("pricing.md")
+
+
+def test_incremental_compile_is_idempotent(atlas_ws):
+    """Compiling again with no source change adds no changelog entries."""
+    from sworker import knowledge as K
+
+    before = K.atlas_index_status(atlas_ws.atlas_dir)["changelog_entries"]
+    rep = K.incremental_compile([str(atlas_ws.company_dir)], atlas_ws.atlas_dir)
+    assert rep.get("ok")
+    after = K.atlas_index_status(atlas_ws.atlas_dir)["changelog_entries"]
+    # No source changed -> the delta path writes nothing.
+    assert after == before, (before, after)
+
+
+def test_rebuild_wipes_and_recompiles(atlas_ws):
+    """rebuild_index wipes the store and recompiles from scratch."""
+    from sworker import knowledge as K
+
+    rep = K.rebuild_index([str(atlas_ws.company_dir)], atlas_ws.atlas_dir)
+    assert rep.get("ok"), rep
+    st = K.atlas_index_status(atlas_ws.atlas_dir)
+    assert st["compiled"] is True
+    assert st["sources"] >= 1
+    # A fresh rebuild produces a clean changelog (entries from this cycle only).
+    assert st["changelog_entries"] >= 1
+    assert st["stale_count"] == 0
+
+
+def test_atlas_status_fail_closed_when_no_index(tmp_path):
+    """A non-existent index reports NOT compiled; never a fabricated status."""
+    from sworker import knowledge as K
+
+    empty = tmp_path / "nope"
+    st = K.atlas_index_status(str(empty))
+    assert st["compiled"] is False
+    assert st["reason"] == "no-index"
+    assert st["stale_count"] == 0
+    assert st["sources"] == 0
+
+
+# ---------------------------------------------------------------------------
+# §18 ingestion adapters — pdf/docx/json (fail-closed)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_json_normalizes_to_markdown(tmp_path):
+    from sworker import knowledge as K
+
+    p = tmp_path / "data.json"
+    p.write_text(json.dumps(
+        {"company": "Acme", "regions": [{"name": "north", "rev": 120}, {"name": "south", "rev": 90}]}
+    ))
+    text = K.extract_json(str(p))
+    assert text is not None
+    assert "## company" in text
+    assert "Acme" in text
+    assert "| name | rev |" in text  # array-of-objects -> table
+    assert "| north | 120 |" in text
+
+
+def test_collect_sources_picks_up_json_and_skips_unsupported(tmp_path):
+    from sworker import knowledge as K
+
+    (tmp_path / "a.md").write_text("# A\nAcme runs north and south.\n")
+    (tmp_path / "b.json").write_text(json.dumps(
+        {"company": "Acme Coffee", "note": "Acme operates in north and south regions."}
+    ))
+    (tmp_path / "c.txt").write_text("ignored plaintext")  # unsupported ext
+    # a pdf with no parser available -> reported as skipped, not ingested
+    (tmp_path / "d.pdf").write_bytes(b"%PDF-1.4 fake")
+    found = K.collect_sources([str(tmp_path)])
+    assert len(found["markdown"]) == 1
+    assert len(found["other"]) == 1
+    assert found["other"][0][1] == ".json"
+    skipped = {os.path.basename(s[0]): s[2] for s in found["skipped"]}
+    assert "d.pdf" in skipped
+    assert skipped["d.pdf"] == "pdf-unavailable"
+
+
+def test_compile_knowledge_ingests_json_source_via_adapter(tmp_path):
+    """A JSON source flows through the adapter into Atlas with the real path."""
+    import shutil
+    from sworker.config import Workspace
+    from sworker import knowledge as K
+
+    if not K.atlas_status()["available"]:
+        pytest.skip("hermes_atlas not importable")
+    home = tmp_path / "acme"
+    (home / "company").mkdir(parents=True)
+    (home / "company" / "notes.md").write_text("# Acme\nAcme operates in north and south regions.\n")
+    (home / "company" / "data.json").write_text(
+        json.dumps({"company": "Acme", "regions": [{"name": "north", "rev": 120}]})
+    )
+    ws = Workspace(str(home))
+    ws.ensure()
+    rep = K.compile_knowledge([ws.company_dir], ws.atlas_dir)
+    assert rep.get("ok"), rep
+    assert rep["adapter_files"] == 1, rep
+    assert rep["markdown_files"] == 1, rep
+    from hermes_atlas.store import AtlasStore
+
+    st = AtlasStore(ws.atlas_dir)
+    jsrc = [s for s in st.read_all("sources") if s.get("path", "").endswith(".json")]
+    assert jsrc, "json source not recorded in store"
+    assert jsrc[0]["path"].endswith(".json")
+    # §17 stale detection now tracks the real json file
+    stale = K.atlas_index_status(ws.atlas_dir)
+    assert stale["sources"] == 2
+    shutil.rmtree(home)
+
+
+def test_collect_sources_no_markdown_yields_reports_adapters(tmp_path):
+    """With no ingestable content, the fail-closed report still lists adapters."""
+    from sworker import knowledge as K
+
+    (tmp_path / "x.pdf").write_bytes(b"%PDF-1.4 fake")
+    found = K.collect_sources([str(tmp_path)])
+    assert found["count"] == 0
+    assert any(s[2] == "pdf-unavailable" for s in found["skipped"])
+
+
+# ---------------------------------------------------------------------------
+# §19 sync watcher — fail-closed poll / recompile on change
+# ---------------------------------------------------------------------------
+
+
+def test_watch_knowledge_recompiles_on_file_change(tmp_path):
+    """Editing a source triggers an incremental recompile via the watcher."""
+    import shutil
+    from sworker.config import Workspace
+    from sworker import knowledge as K
+
+    if not K.atlas_status()["available"]:
+        pytest.skip("hermes_atlas not importable")
+    home = tmp_path / "acme"
+    (home / "company").mkdir(parents=True)
+    (home / "company" / "notes.md").write_text("# Acme\nAcme operates in north and south regions.\n")
+    ws = Workspace(str(home))
+    ws.ensure()
+    # initial compile
+    K.compile_knowledge([ws.company_dir], ws.atlas_dir)
+    from hermes_atlas.store import AtlasStore
+
+    before = AtlasStore(ws.atlas_dir).stats().get("sources", 0)
+    events: list = []
+    stop = K.watch_knowledge(
+        [ws.company_dir], ws.atlas_dir, interval=0.2,
+        on_compile=lambda r: events.append(r),
+    )
+    try:
+        # give the loop one poll to record the baseline snapshot
+        time.sleep(0.3)
+        # now change a source file
+        (home / "company" / "notes.md").write_text(
+            "# Acme\nAcme operates in north and south regions. Q3 revenue rose 12%.\n"
+        )
+        # wait for the watcher to detect + recompile
+        for _ in range(50):
+            if events:
+                break
+            time.sleep(0.1)
+    finally:
+        stop.set()
+    shutil.rmtree(home)
+    assert events, "watcher never recompiled after a file change"
+    assert events[-1].get("ok"), events[-1]
+
+
+def test_watch_knowledge_fail_closed_on_compile_error(tmp_path, monkeypatch):
+    """A compile error is reported, not swallowed; the watcher keeps running."""
+    import shutil
+    from sworker.config import Workspace
+    from sworker import knowledge as K
+
+    if not K.atlas_status()["available"]:
+        pytest.skip("hermes_atlas not importable")
+    home = tmp_path / "acme"
+    (home / "company").mkdir(parents=True)
+    (home / "company" / "notes.md").write_text("# Acme\nAcme runs north and south.\n")
+    ws = Workspace(str(home))
+    ws.ensure()
+    K.compile_knowledge([ws.company_dir], ws.atlas_dir)
+
+    def _boom(*a, **k):
+        raise RuntimeError("injected compile failure")
+
+    events: list = []
+    stop = K.watch_knowledge(
+        [ws.company_dir], ws.atlas_dir, interval=0.2,
+        on_compile=lambda r: events.append(r),
+    )
+    try:
+        time.sleep(0.3)
+        # force every incremental compile to fail; watcher must still report it
+        monkeypatch.setattr(K, "incremental_compile", _boom)
+        (home / "company" / "notes.md").write_text("# Acme\nAcme runs north, south, east.\n")
+        for _ in range(50):
+            if any(e.get("reason") == "watch-compile-error" for e in events):
+                break
+            time.sleep(0.1)
+    finally:
+        stop.set()
+    shutil.rmtree(home)
+    assert any(e.get("reason") == "watch-compile-error" for e in events), events
+
+
+def test_roots_snapshot_detects_change(tmp_path):
+    """_snapshot_changed is fail-closed and sensitive to add/edit/remove."""
+    from sworker import knowledge as K
+
+    a = tmp_path / "a.md"
+    a.write_text("hello")
+    snap1 = K._roots_snapshot([str(tmp_path)])
+    assert a.resolve().as_posix() in {os.path.abspath(k) for k in snap1}
+    assert not K._snapshot_changed(snap1, snap1)
+    # edit -> size/mtime change
+    time.sleep(0.01)
+    a.write_text("hello world longer")
+    snap2 = K._roots_snapshot([str(tmp_path)])
+    assert K._snapshot_changed(snap1, snap2)
+    # add a file
+    b = tmp_path / "b.md"
+    b.write_text("new")
+    snap3 = K._roots_snapshot([str(tmp_path)])
+    assert K._snapshot_changed(snap2, snap3)
+    # remove a file
+    b.unlink()
+    snap4 = K._roots_snapshot([str(tmp_path)])
+    assert K._snapshot_changed(snap3, snap4)

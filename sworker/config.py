@@ -35,6 +35,10 @@ class WorkerConfig:
     knowledge: List[str] = field(default_factory=list)
     tools: List[str] = field(default_factory=list)
     procedures: List[str] = field(default_factory=list)
+    # §20 connectors: default-deny external-system access. Each entry declares a
+    # connector kind + allow-list + secret refs. A connector is NEVER active
+    # unless explicitly listed here.
+    connectors: List[Dict[str, Any]] = field(default_factory=list)
     policy: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_POLICY))
     workspace: str = ""
     fs_roots: List[str] = field(default_factory=list)     # writable/readable boundary
@@ -43,10 +47,58 @@ class WorkerConfig:
     max_steps: int = 12
     timeout: int = 60
     max_output: int = 20000
+    # resource controls (spec §10) — every limit is enforced; exhaustion is a
+    # structured failure, never silent.
+    max_runtime: int = 300          # wall-clock seconds for the whole run
+    max_actions: int = 24          # total tool actions a run may attempt
+    max_tool_calls: int = 100       # total tool invocations (incl. retries)
+    max_artifact_bytes: int = 5_000_000
+    max_python_runtime: int = 60    # per python.run invocation
+    max_shell_runtime: int = 30     # per shell.exec invocation
+    max_network_requests: int = 20  # http/network tool invocations per run
+    # §21 browser hardening — default-deny on every axis; a worker must opt in.
+    browser_allow: List[str] = field(default_factory=list)   # regex allow-list of URLs
+    browser_timeout: int = 30       # per-open cap (seconds)
+    browser_downloads: bool = False  # allow browser.download into fs boundary
+    browser_uploads: bool = False    # allow browser.upload from fs boundary
+    browser_credential_refs: List[str] = field(default_factory=list)  # secret refs the browser may inject
+    browser_private_session: bool = True  # no shared cookies/profile unless explicitly False
+    # §22 messaging policy — default-deny channel + optional rate cap.
+    message_allow: List[str] = field(default_factory=list)  # regex allow-list of channels
+    message_rate_limit: int = 0  # max messages per run (0 = only bounded by max_actions)
+    # §9 execution isolation — which sandbox backend commands run in.
+    sandbox: str = "none"  # "none" (host, shallow) | "docker" (container, real isolation)
+    # §54 network egress registry — default-deny host allow-list for outbound HTTP.
+    egress_allow: List[str] = field(default_factory=list)  # regex host allow-list; empty = deny all
+    # §55 DLP primitives — opt-in named detectors run over egress payloads.
+    dlp_rules: List[str] = field(default_factory=list)  # names from BUILTIN_DLP_RULES; empty = no scanning
+    # §26 worker lifecycle — disabled workers are refused by the engine.
+    disabled: bool = False
+    # §24 workflow triggers — opt-in automation that launches this worker.
+    triggers: List[Dict[str, Any]] = field(default_factory=list)
+    # §45 HITL escalation — per-risk approval quorum + minimum role. Shape:
+    #   approval_policy: { destructive: {quorum: 2, min_role: operator} }
+    # Missing risks fall back to {quorum: 1, min_role: ""} (single approver,
+    # any role). This is additive: it never lowers the existing approval gate.
+    approval_policy: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     path: str = ""
 
     def policy_for(self, risk: RiskLevel | str) -> str:
         return self.policy.get(RiskLevel(risk).value, "approve")
+
+    def approval_policy_for(self, risk: RiskLevel | str) -> Dict[str, Any]:
+        """§45 — resolve the escalation requirements for a risk level.
+
+        Returns {"quorum": int>=1, "min_role": str}. Absent risks fall back to
+        a single approver with no role minimum. Unknown keys are dropped rather
+        than trusted.
+        """
+        raw = self.approval_policy.get(RiskLevel(risk).value, {}) or {}
+        quorum = int(raw.get("quorum", 1)) if raw.get("quorum") is not None else 1
+        if quorum < 1:
+            quorum = 1  # fail-closed: never require zero approvals
+        min_role = str(raw.get("min_role", "") or "")
+        return {"quorum": quorum, "min_role": min_role}
 
     def resolved_fs_roots(self) -> List[str]:
         """Absolute, realpath'd boundary roots. Always includes the workspace so
@@ -70,6 +122,7 @@ class WorkerConfig:
             "knowledge": self.knowledge,
             "tools": self.tools,
             "procedures": self.procedures,
+            "connectors": self.connectors,
             "policy": self.policy,
             "workspace": self.workspace,
             "fs_roots": self.fs_roots,
@@ -77,6 +130,27 @@ class WorkerConfig:
             "env_allow": self.env_allow,
             "max_steps": self.max_steps,
             "path": self.path,
+            "max_runtime": self.max_runtime,
+            "max_actions": self.max_actions,
+            "max_tool_calls": self.max_tool_calls,
+            "max_artifact_bytes": self.max_artifact_bytes,
+            "max_python_runtime": self.max_python_runtime,
+            "max_shell_runtime": self.max_shell_runtime,
+            "max_network_requests": self.max_network_requests,
+            "browser_allow": self.browser_allow,
+            "browser_timeout": self.browser_timeout,
+            "browser_downloads": self.browser_downloads,
+            "browser_uploads": self.browser_uploads,
+            "browser_credential_refs": self.browser_credential_refs,
+            "browser_private_session": self.browser_private_session,
+            "message_allow": self.message_allow,
+            "message_rate_limit": self.message_rate_limit,
+            "sandbox": self.sandbox,
+            "egress_allow": self.egress_allow,
+            "dlp_rules": self.dlp_rules,
+            "disabled": self.disabled,
+            "triggers": self.triggers,
+            "approval_policy": self.approval_policy,
         }
 
 
@@ -165,12 +239,28 @@ def load_worker(path: str, workspace: Optional[Workspace] = None) -> WorkerConfi
         knowledge=[_abs(str(k)) for k in (data.get("knowledge") or [])],
         tools=[str(t) for t in (data.get("tools") or [])],
         procedures=[str(p) for p in (data.get("procedures") or [])],
+        connectors=[dict(c) for c in (data.get("connectors") or [])],
         policy=policy,
         workspace=ws.root,
         fs_roots=[_abs(str(r)) for r in (data.get("fs_roots") or [])] or [ws.root],
         shell_allow=[str(c) for c in (data.get("shell_allow") or [])],
         env_allow=[str(e) for e in (data.get("env_allow") or [])],
         max_steps=int(data.get("max_steps") or 12),
+        browser_allow=[str(c) for c in (data.get("browser_allow") or [])],
+        browser_timeout=int(data.get("browser_timeout") or 30),
+        browser_downloads=bool(data.get("browser_downloads") or False),
+        browser_uploads=bool(data.get("browser_uploads") or False),
+        browser_credential_refs=[str(c) for c in (data.get("browser_credential_refs") or [])],
+        browser_private_session=bool(data.get("browser_private_session")
+                                    if data.get("browser_private_session") is not None else True),
+        message_allow=[str(c) for c in (data.get("message_allow") or [])],
+        message_rate_limit=int(data.get("message_rate_limit") or 0),
+        sandbox=str(data.get("sandbox") or "none"),
+        egress_allow=[str(c) for c in (data.get("egress_allow") or [])],
+        dlp_rules=[str(c) for c in (data.get("dlp_rules") or [])],
+        disabled=bool(data.get("disabled") or False),
+        triggers=[dict(t) for t in (data.get("triggers") or [])],
+        approval_policy={str(k): dict(v) for k, v in (data.get("approval_policy") or {}).items()},
         path=os.path.abspath(path),
     )
     del base

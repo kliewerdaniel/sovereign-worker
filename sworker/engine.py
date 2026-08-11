@@ -24,12 +24,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from .approvals import ApprovalManager
 from .config import WorkerConfig
+from .degradation import (
+    DegradationLedger,
+    MODEL_FALLBACK,
+    KNOWLEDGE_UNCOMPILED,
+    CRITICAL,
+    INCIDENT_ACTIVE,
+)
 from .evidence import EvidenceLedger
 from .inference import Inference, NullInference
 from .models import (
@@ -50,9 +59,12 @@ from .models import (
     now,
 )
 from .permissions import DecompositionGuard, PermissionEngine
+from .safemode import SafeMode, SAFE_MODE_BLOCK
 from .store import WorkerStore
 from .tools import ToolContext, ToolError, ToolRegistry, build_registry
 from . import verify as verify_mod
+from .connectors import ConnectorManager, ConnectorError
+from .injection import scan_dict as _scan_injection
 
 MAX_STEPS = 24
 
@@ -100,7 +112,28 @@ class WorkerEngine:
         self.llm = inference or NullInference()
         base = registry or build_registry()
         self.registry = base.subset(worker.tools) if worker.tools else base
-        self.approvals = ApprovalManager(store)
+        self.approvals = ApprovalManager(store, worker=self.worker)
+        self._active_ctx: Optional[ToolContext] = None  # ctx of the in-flight run, for cancel()
+
+        # §20 connector architecture: default-deny registry. A worker must
+        # explicitly declare connectors; nothing external is reachable otherwise.
+        self.connectors = ConnectorManager(
+            specs=worker.connectors or None,
+            secret_resolver=self._resolve_secret,
+        )
+
+    def _resolve_secret(self, ref: str) -> str:
+        """Resolve a secret ref from the §8 store. Fail-closed: any failure
+        (store unavailable, crypto missing, secret absent) surfaces as an
+        exception the ConnectorManager turns into a refusal."""
+        from .secrets import SecretStore
+
+        key_path = os.path.join(self.store.root, "secrets.key")
+        try:
+            ss = SecretStore(self.store, key_path=key_path)
+        except Exception as exc:
+            raise ConnectorError(f"secret store unavailable: {exc}") from exc
+        return ss.get(ref)
 
     # -- context -----------------------------------------------------------
     def _tool_ctx(self, run) -> ToolContext:
@@ -115,6 +148,20 @@ class WorkerEngine:
             env_allow=list(self.worker.env_allow),
             timeout=self.worker.timeout,
             max_output=self.worker.max_output,
+            max_python_runtime=self.worker.max_python_runtime,
+            max_shell_runtime=self.worker.max_shell_runtime,
+            browser_allow=list(self.worker.browser_allow),
+            browser_timeout=self.worker.browser_timeout,
+            browser_downloads=self.worker.browser_downloads,
+            browser_uploads=self.worker.browser_uploads,
+            browser_credential_refs=list(self.worker.browser_credential_refs),
+            browser_private_session=self.worker.browser_private_session,
+            secret_resolver=self._resolve_secret,
+            message_allow=list(self.worker.message_allow),
+            message_rate_limit=self.worker.message_rate_limit,
+            sandbox=self.worker.sandbox,
+            egress_allow=list(self.worker.egress_allow),
+            dlp_rules=list(self.worker.dlp_rules),
         )
 
     def _tool_catalog(self) -> str:
@@ -131,6 +178,61 @@ class WorkerEngine:
             )
         return "\n".join(lines)
 
+    # -- §20 connectors -----------------------------------------------------
+
+    def connector_action(
+        self, kind: str, action: str, target: str, args: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Execute a governed connector action.
+
+        This is the ONLY path through which a worker reaches an external system
+        via a connector. It is fail-closed: the action is refused unless the
+        connector is enabled AND the target passes its allow-list AND (if the
+        connector needs credentials) the secret refs resolve. No credential value
+        is returned in the result — only confirmations and transport handles.
+        """
+        args = args or {}
+        ok, reason, conn = self.connectors.authorize(kind, action, target)
+        if not ok:
+            return {
+                "ok": False,
+                "refused": True,
+                "reason": reason,
+                "kind": kind,
+                "target": target,
+            }
+        try:
+            creds = self.connectors.resolve_credentials(kind)
+        except ConnectorError as exc:
+            return {
+                "ok": False,
+                "refused": True,
+                "reason": f"credential resolution failed: {exc}",
+                "kind": kind,
+                "target": target,
+            }
+        if conn is None:
+            return {
+                "ok": False,
+                "refused": True,
+                "reason": f"connector {kind!r} became unavailable",
+                "kind": kind,
+                "target": target,
+            }
+        plan = conn.execute(action, target, args, creds)
+        # The plan is a transport descriptor, not an execution result: the engine
+        # returns what WOULD run and what credentials names are in play, never the
+        # values. Actual transmission is performed by the delegated tool inside
+        # the worker's sandbox, where the resolver-injected env var lives.
+        return {
+            "ok": True,
+            "kind": kind,
+            "action": action,
+            "target": target,
+            "plan": {k: v for k, v in plan.items() if k != "args"} | {"args_keys": list(plan.get("args", {}))},
+            "credentials_used": sorted(creds.keys()),
+        }
+
     # -- lifecycle ---------------------------------------------------------
     def run(
         self,
@@ -144,6 +246,12 @@ class WorkerEngine:
     ) -> RunResult:
         if resume_run_id:
             return self._resume(resume_run_id, on_event=on_event)
+        # §26 — disabled workers are refused at the boundary (fail closed).
+        if getattr(self.worker, "disabled", False):
+            raise RuntimeError(
+                f"worker {self.worker.name!r} is disabled; enable it before running "
+                f"(sworker worker enable {self.worker.name})"
+            )
 
         task = Task(
             worker=self.worker.name,
@@ -156,11 +264,58 @@ class WorkerEngine:
         run = Run(worker=self.worker.name, task_id=task.id, trigger=trigger, procedure=procedure)
         self.store.put("runs", run, event="run.started")
         self._emit(on_event, "run.started", {"run_id": run.id, "request": request})
+        # lifecycle: PENDING -> PLANNING
+        from . import statemachine as sm
+
+        sm.transition(run, RunStatus.PLANNING, store=self.store, actor="engine", reason="planning")
 
         ledger = EvidenceLedger(self.store, run.id)
         guard = DecompositionGuard()
         perms = PermissionEngine(self.worker, guard)
         ctx = self._tool_ctx(run)
+        self._active_ctx = ctx
+
+        # §61 — graceful degradation ledger for this run.
+        deg = DegradationLedger(self.store, run_id=run.id)
+        if not self.llm.available():
+            deg.record(
+                MODEL_FALLBACK,
+                "no reachable language model; using deterministic fallback planner",
+                severity="warn",
+                mitigation="start a local model at SWORKER_LLM_URL / --llm-url",
+            )
+
+        # §62 — safe mode is read once per run and applied at execution time.
+        # When enabled it fails closed: any action above the permitted risk is
+        # blocked and recorded as a critical degradation (see _execute).
+        safe = SafeMode(self.store)
+
+        # §63 — incident response: while an incident is open the platform is
+        # frozen, so we must not launch *new* work into it. We block here, before
+        # any planning or execution, and record a critical degradation so the run
+        # is reported BLOCKED rather than silently dropped.
+        from .incident import IncidentLedger
+        if IncidentLedger(self.store).active():
+            deg.record(
+                INCIDENT_ACTIVE,
+                "an incident is open; new runs are refused until it is closed",
+                severity=CRITICAL,
+                mitigation="sworker incident close  (then sworker safemode off to stand the platform back down)",
+            )
+            run.summary = "blocked: an incident is open"
+            run.error = "incident_active"
+            run.finished = now()
+            run.degradations = deg.summary()
+            sm.transition(run, RunStatus.BLOCKED, store=self.store, actor="engine", reason="incident active")
+            self._emit(on_event, "run.blocked", {"run_id": run.id, "reason": "incident_active"})
+            return RunResult(
+                run=run,
+                status=RunStatus.BLOCKED,
+                summary=run.summary,
+                artifacts=[],
+                claims=[],
+                pending_approvals=[],
+            )
 
         # --- INTENT + PLAN ---
         intent, steps = self._plan(request, procedure, inputs or {})
@@ -184,7 +339,7 @@ class WorkerEngine:
         plan.step_ids = [s.id for s in step_records]
         self.store.put("plans", plan, event="plan.finalized")
 
-        return self._execute(run, plan, step_records, ledger, perms, ctx, on_event, computed=[])
+        return self._execute(run, plan, step_records, ledger, perms, ctx, on_event, deg, computed=[], safe=safe)
 
     # -- planning ----------------------------------------------------------
     def _plan(
@@ -393,8 +548,12 @@ class WorkerEngine:
         perms: PermissionEngine,
         ctx: ToolContext,
         on_event,
+        deg: Optional[DegradationLedger] = None,
         computed: Optional[List[Dict[str, Any]]] = None,
+        safe: Optional["SafeMode"] = None,
     ) -> RunResult:
+        if deg is None:
+            deg = DegradationLedger(self.store, run_id=run.id)
         failures = 0
         executed = 0
         blocked = False
@@ -402,7 +561,71 @@ class WorkerEngine:
         if computed is None:
             computed = []
 
+        # --- resource accounting (spec §10) ---------------------------------
+        cfg = self.worker
+        budget = {
+            "actions": cfg.max_actions,
+            "tool_calls": cfg.max_tool_calls,
+            "network": cfg.max_network_requests,
+        }
+        started_at = time.time()
+        max_runtime = cfg.max_runtime
+        resource_error = {"msg": ""}
+
+        def _over_runtime() -> bool:
+            return (time.time() - started_at) > max_runtime
+
+        def _exhausted() -> str:
+            if budget["actions"] <= 0:
+                return "max_actions exceeded"
+            if budget["tool_calls"] <= 0:
+                return "max_tool_calls exceeded"
+            if budget["network"] <= 0:
+                return "max_network_requests exceeded"
+            if _over_runtime():
+                return "max_runtime exceeded"
+            return ""
+
+        # watchdog: if the wall-clock budget is blown, kill the whole run.
+        def _watchdog() -> None:
+            while time.time() - started_at <= max_runtime:
+                time.sleep(0.25)
+            if self._active_ctx is not None and self._active_ctx.run_id == run.id:
+                self._kill_active_ctx()
+
+        threading.Thread(target=_watchdog, name="sworker-watchdog", daemon=True).start()
+
+        from . import statemachine as sm
+
+        sm.transition(run, RunStatus.EXECUTING, store=self.store, actor="engine", reason="executing")
+
+        # §61 — if this run leans on compiled knowledge but Atlas is unavailable,
+        # record the degradation (the knowledge tools still function, but on a
+        # degraded plaintext backend). Fail-closed: absence is never "success".
+        if any(t in self.registry.names() for t in ("knowledge_search", "knowledge_compile")):
+            try:
+                from . import knowledge as K
+
+                if not K.atlas_status()["available"]:
+                    deg.record(
+                        KNOWLEDGE_UNCOMPILED,
+                        "Hermes Atlas unavailable; knowledge served via uncompiled plaintext grep",
+                        severity="warn",
+                        mitigation="install hermes-atlas / set SWORKER_ATLAS_HOME",
+                    )
+            except Exception:
+                # probing Atlas must never break a run; a probe failure is itself
+                # a degradation worth recording, but we keep it quiet.
+                pass
+
         for step in steps:
+            # resource guard: bail out the moment any budget is blown (spec §10).
+            exhausted = _exhausted()
+            if exhausted:
+                resource_error["msg"] = exhausted
+                run.error = exhausted
+                break
+
             if not step.tool:
                 step.status = StepStatus.SKIPPED
                 step.note = "reasoning step; no tool invocation"
@@ -440,6 +663,33 @@ class WorkerEngine:
             )
             self.store.put("actions", action, event="action.proposed")
 
+            # §62 — safe mode fails closed. If the current safe-mode level
+            # forbids this action's risk, block it and record a CRITICAL
+            # degradation so the run is never reported as a clean SUCCESS. We
+            # block *before* approval/deny handling: safe mode overrides both —
+            # an operator in incident response would rather re-trigger a blocked
+            # action than have it slip through an auto-approved path.
+            if safe is not None and safe.is_blocked(decision.risk):
+                if not any(e.category == SAFE_MODE_BLOCK for e in deg.entries()):
+                    deg.record(
+                        SAFE_MODE_BLOCK,
+                        safe.reason(decision.risk),
+                        severity=CRITICAL,
+                        mitigation="disable safe mode or raise its level (sworker safemode off / locked)",
+                    )
+                action.status = ActionStatus.DENIED
+                self.store.put("actions", action, event="action.denied")
+                step.status = StepStatus.BLOCKED
+                step.note = safe.reason(decision.risk)
+                self.store.put("steps", step, event="step.blocked")
+                blocked = True
+                self._emit(on_event, "action.denied", {"summary": action.summary, "reason": safe.reason(decision.risk)})
+                continue
+            budget["actions"] -= 1
+            budget["tool_calls"] -= 1
+            if "network" in tool.categories:
+                budget["network"] -= 1
+
             if decision.denied:
                 action.status = ActionStatus.DENIED
                 self.store.put("actions", action, event="action.denied")
@@ -462,6 +712,8 @@ class WorkerEngine:
                 step.status = StepStatus.AWAITING_APPROVAL
                 step.note = f"approval {appr.id} requested"
                 self.store.put("steps", step, event="step.awaiting_approval")
+                sm_transition = __import__("sworker.statemachine", fromlist=["transition"]).transition
+                sm_transition(run, RunStatus.AWAITING_APPROVAL, store=self.store, actor="engine", reason=f"awaiting approval {appr.id}")
                 awaiting = True
                 self._emit(
                     on_event,
@@ -481,13 +733,22 @@ class WorkerEngine:
         run.verifications = self._derive_verifications(computed)
         self._verify_run(run, ledger, ctx)
 
+        from . import statemachine as sm
+
+        if not awaiting:
+            # If we were awaiting approval (a prior step), we resume into
+            # EXECUTING; otherwise move EXECUTING -> VERIFYING -> terminal.
+            if run.status == RunStatus.AWAITING_APPROVAL:
+                sm.transition(run, RunStatus.EXECUTING, store=self.store, actor="engine", reason="resumed after approval")
+            sm.transition(run, RunStatus.VERIFYING, store=self.store, actor="engine", reason="verifying")
+
         # If the deterministic fallback wrote a report artifact, fold the
         # derived figure(s) into it so the artifact proves its own numbers.
         if computed:
             arts = self.store.find("artifacts", run_id=run.id, order="created")
             self._backfill_artifact_figures(run, arts, computed, ctx)
 
-        return self._finalize(run, ledger, failures, executed, blocked, awaiting, on_event, computed)
+        return self._finalize(run, ledger, deg, failures, executed, blocked, awaiting, on_event, computed, resource_error["msg"])
 
     def _execute_action(
         self, run, step, action, tool, args, ctx, ledger: EvidenceLedger, on_event, computed=None
@@ -522,6 +783,10 @@ class WorkerEngine:
                 self._emit(on_event, "step.retry", {"step": step.description, "error": result.error})
 
         assert result is not None
+        # §44 — scan the ingested content for prompt-injection attempts before
+        # it is trusted. The verdict is recorded on the observation (auditably)
+        # but never used to escalate the run's risk or spawn new tool calls.
+        inj = _scan_injection({"output": result.output, "error": result.error, **(result.data or {})})
         obs = Observation(
             run_id=run.id,
             action_id=action.id,
@@ -531,6 +796,7 @@ class WorkerEngine:
             data=result.data,
             truncated=result.truncated,
             duration_ms=int((time.time() - t0) * 1000),
+            injection=inj.rule or "",
         )
         self.store.put("observations", obs, event="observation.recorded")
         action.observation_id = obs.id
@@ -538,6 +804,7 @@ class WorkerEngine:
         self.store.put("actions", action, event="action.completed")
 
         evs = ledger.from_observation(obs, tool.name, result.evidence)
+        run_claims = self.store.find("claims", run_id=run.id)
         for path in result.artifacts:
             art = Artifact(
                 run_id=run.id,
@@ -546,6 +813,21 @@ class WorkerEngine:
                 bytes=os.path.getsize(path) if os.path.exists(path) else 0,
                 description=step.description,
             )
+            # §16 claim exposure: record which claims this artifact surfaces so a
+            # reader (and the fail-closed finalizer) can trace every stated claim
+            # back to its provenance. A claim is "exposed" if its text appears in
+            # the artifact body.
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as _afh:
+                    _body = _afh.read()
+            except OSError:
+                _body = ""
+            exposed = [
+                c["id"] for c in run_claims
+                if c.get("text") and c["text"].strip() and c["text"].strip() in _body
+            ]
+            if exposed:
+                art.claim_ids = exposed
             self.store.put("artifacts", art, event="artifact.created")
 
         step.status = StepStatus.DONE if result.ok else StepStatus.FAILED
@@ -705,9 +987,11 @@ class WorkerEngine:
 
     # -- finalization ------------------------------------------------------
     def _finalize(
-        self, run: Run, ledger: EvidenceLedger, failures, executed, blocked, awaiting, on_event,
-        computed: Optional[List[Dict[str, Any]]] = None,
+        self, run: Run, ledger: EvidenceLedger, deg: Optional[DegradationLedger] = None, failures=0, executed=0, blocked=False, awaiting=False, on_event=None,
+        computed: Optional[List[Dict[str, Any]]] = None, resource_exhausted: str = "",
     ) -> RunResult:
+        if deg is None:
+            deg = DegradationLedger(self.store, run_id=getattr(run, "id", ""))
         if computed is None:
             computed = []
         evidence = ledger.all_evidence()
@@ -716,8 +1000,15 @@ class WorkerEngine:
         pending = self.approvals.pending(run.id)
         vers = self.store.find("verifications", run_id=run.id)
         failed_vers = [v for v in vers if v["outcome"] == VerificationOutcome.FAIL.value]
+        unverifiable_vers = [
+            v for v in vers if v["outcome"] == VerificationOutcome.UNVERIFIABLE.value
+        ]
+        declared_verifications = bool(getattr(run, "verifications", None)) or bool(vers)
 
-        if awaiting or pending:
+        if resource_exhausted:
+            status = RunStatus.BLOCKED
+            run.error = resource_exhausted
+        elif awaiting or pending:
             status = RunStatus.AWAITING_APPROVAL
         elif blocked:
             status = RunStatus.BLOCKED
@@ -734,7 +1025,67 @@ class WorkerEngine:
         else:
             status = RunStatus.SUCCESS
 
-        run.status = status
+        # Fail-closed verification hardening (§7): if this run declared or
+        # produced verification checks, an UNVERIFIABLE result (unknown check,
+        # error during recompute, missing expected value) must NOT be reported
+        # as full SUCCESS — it means a number could not actually be proven, so
+        # the run is at most PARTIAL_SUCCESS. A clean SUCCESS requires every
+        # declared check to PASS.
+        if status is RunStatus.SUCCESS and declared_verifications and unverifiable_vers:
+            status = RunStatus.PARTIAL_SUCCESS
+            run.error = run.error or (
+                f"{len(unverifiable_vers)} verification check(s) could not be proven"
+            )
+
+        # Fail-closed claim exposure (§16): an artifact that surfaces claims to a
+        # reader must not be reported full SUCCESS if those exposed claims carry
+        # no provenance at all (no evidence link, no verification). A claim
+        # exported with nothing backing it is unprovable — exactly the silent
+        # SUCCESS this engine forbids. Refuted/hypothesized-but-unverified claims
+        # keep the run at PARTIAL_SUCCESS; the presence of ANY backed claim clears
+        # the bar (the artifact then exposes both sourced and unsourced claims,
+        # which a reader can distinguish via claim.provenance).
+        if status is RunStatus.SUCCESS:
+            exposed_ids = {cid for a in arts for cid in (a.get("claim_ids") or [])}
+            if exposed_ids:
+                claims_by_id = {c["id"]: c for c in claims}
+                unbacked = [
+                    cid for cid in exposed_ids
+                    if cid in claims_by_id
+                    and not (claims_by_id[cid].get("evidence_ids") or claims_by_id[cid].get("verification_ids"))
+                ]
+                if unbacked:
+                    status = RunStatus.PARTIAL_SUCCESS
+                    run.error = run.error or (
+                        f"{len(unbacked)} surfaced claim(s) have no provenance (evidence/verification)"
+                    )
+
+        # §61 — surface recorded degradations on the run, and fail-closed: a
+        # *critical* degradation (a safety/correctness capability that could not
+        # run) must not be reported as full SUCCESS. Degradations are already
+        # persisted + audited where they were recorded; here we make them
+        # visible on the run result and apply the downgrade.
+        run.degradations = deg.summary()
+
+        # §61 — fail-closed downgrade: a critical degradation that occurred wins
+        # over a SUCCESS verdict. We re-check after the claim-exposure block so
+        # neither can silently mask the other.
+        if status is RunStatus.SUCCESS and deg.any_critical():
+            status = RunStatus.PARTIAL_SUCCESS
+            run.error = run.error or "run completed with a critical capability degradation"
+
+
+        # Every run passes through VERIFYING on the way to a terminal state;
+        # bring it there via the legal path, then to the final status.
+        from . import statemachine as sm
+        from .statemachine import is_terminal
+
+        if status != run.status and not is_terminal(run.status):
+            if run.status == RunStatus.AWAITING_APPROVAL:
+                sm.transition(run, RunStatus.EXECUTING, store=self.store, actor="engine", reason="resumed after approval")
+            if run.status != RunStatus.VERIFYING:
+                sm.transition(run, RunStatus.VERIFYING, store=self.store, actor="engine", reason="verifying")
+            sm.transition(run, status, store=self.store, actor="engine", reason="final status")
         run.finished = now()
         run.evidence_count = len(evidence)
         run.claim_count = len(claims)
@@ -775,8 +1126,22 @@ class WorkerEngine:
         if not rec:
             raise KeyError(f"no run {run_id!r}")
         run = Run(**{k: v for k, v in rec.items() if k in Run.__dataclass_fields__})
+        # A run that is already in a terminal state has nothing to resume;
+        # re-finalizing it would corrupt the audit trail. Refuse cleanly.
+        from .statemachine import is_terminal, RunStatus as _RS
+
+        if is_terminal(RunStatus(run.status)):
+            return RunResult(
+                run=run,
+                status=RunStatus(run.status),
+                summary=run.summary or f"run already {run.status}",
+                artifacts=[],
+                claims=[],
+                pending_approvals=[],
+            )
         ledger = EvidenceLedger(self.store, run.id)
         guard = DecompositionGuard()
+        deg = DegradationLedger(self.store, run_id=run.id)
         for appr in self.approvals.for_run(run.id):
             if appr["state"] == "REJECTED":
                 guard.record_rejection(appr["risk"])
@@ -806,7 +1171,73 @@ class WorkerEngine:
                     self.store.put("steps", step_rec, event="step.blocked")
                 blocked = True
 
-        return self._finalize(run, ledger, failures, executed, blocked, False, on_event)
+        return self._finalize(run, ledger, deg, failures, executed, blocked, False, on_event)
+
+    # -- cancellation (spec §11) -------------------------------------------
+    def cancel(self, run_id: str, by: str = "user", reason: str = "") -> Run:
+        """Cancel a run. Idempotent: cancelling an already-terminal run is a no-op.
+
+        Propagates to any live child subprocesses (kills their process group),
+        marks the current step/action CANCELLED, transitions the run to the
+        CANCELLED terminal state, and records who/when/why.
+        """
+        rec = self.store.get("runs", run_id)
+        if not rec:
+            raise KeyError(f"no run {run_id!r}")
+        run = Run(**{k: v for k, v in rec.items() if k in Run.__dataclass_fields__})
+        from .statemachine import is_terminal, RunStatus as _RS
+
+        if is_terminal(_RS(run.status)):
+            return run
+
+        # kill any live subprocesses spawned by this run's tools (whole group)
+        self._kill_active_ctx(run_id)
+
+        # --- cancel-specific bookkeeping (only runs on cancel, not watchdog) ---
+        # mark the in-flight step/action cancelled, if any
+        in_flight = self.store.find("steps", run_id=run.id, status=StepStatus.RUNNING.value)
+        for s in in_flight:
+            s["status"] = StepStatus.BLOCKED.value
+            s["note"] = f"cancelled by {by}: {reason}".strip()
+            self.store.put("steps", s, event="step.cancelled")
+        in_flight_act = self.store.find("actions", run_id=run.id, status=ActionStatus.EXECUTING.value)
+        for a in in_flight_act:
+            a["status"] = ActionStatus.SKIPPED.value
+            self.store.put("actions", a, event="action.cancelled")
+
+        run.error = reason or "cancelled"
+        run.finished = now()
+        from . import statemachine as sm
+
+        sm.transition(run, _RS.CANCELLED, store=self.store, actor=by, reason=reason or "cancelled")
+        # stamp the cancel reason on the persisted record (transition reloads +
+        # rewrites the run, so this must happen after it)
+        persisted = self.store.get("runs", run.id)
+        if persisted is not None:
+            persisted["error"] = reason or "cancelled"
+            persisted["finished"] = run.finished
+            self.store.put("runs", persisted, event="run.cancelled")
+        return run
+
+    def _kill_active_ctx(self, run_id: str = "") -> None:
+        """Kill the live child process group(s) for the active tool context.
+
+        Used both by `cancel()` and the resource-budget watchdog. Safe to call
+        when there is no active context.
+        """
+        ctx = self._active_ctx
+        if ctx is None or (run_id and ctx.run_id != run_id):
+            return
+        for pid in ctx.running_subprocesses:
+            try:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            self._active_ctx = None
 
     @staticmethod
     def _emit(cb, event: str, payload: Dict[str, Any]) -> None:

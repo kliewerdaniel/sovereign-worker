@@ -47,6 +47,43 @@ class ToolContext:
     env_allow: List[str] = field(default_factory=list)
     timeout: int = 30
     max_output: int = 20000
+    # live child PIDs registered by the exec tools during a run, so the engine
+    # can kill the whole process group on cancel (spec §11).
+    _live_pids: set = field(default_factory=set, repr=False, compare=False)
+    # per-invocation timeouts (spec §10); the engine sets these from the worker
+    max_python_runtime: int = 60
+    max_shell_runtime: int = 30
+    # §21 browser hardening — default-deny on every axis. The engine fills these
+    # from WorkerConfig; a tool can never widen them.
+    browser_allow: List[str] = field(default_factory=list)   # regex allow-list of URLs
+    browser_timeout: int = 30
+    browser_downloads: bool = False   # whether browser.download is permitted
+    browser_uploads: bool = False     # whether browser.upload is permitted
+    browser_credential_refs: List[str] = field(default_factory=list)  # secret refs the browser may inject
+    browser_private_session: bool = True
+    secret_resolver: Optional[Callable[[str], Optional[str]]] = None  # resolves §8 refs to plaintext
+    # §22 messaging policy — default-deny channel allow-list + per-run rate cap.
+    message_allow: List[str] = field(default_factory=list)
+    message_rate_limit: int = 0
+    messages_sent: int = 0  # engine/tool shared counter for rate limiting within a run
+    # §9 execution isolation — which sandbox backend commands run in.
+    sandbox: str = "none"  # "none" | "docker"
+    # §54 network egress registry — default-deny host allow-list for outbound HTTP.
+    egress_allow: List[str] = field(default_factory=list)
+    # §55 DLP primitives — opt-in named detectors (BUILTIN_DLP_RULES) run over
+    # egress payloads. Empty = no scanning. The engine compiles these into a
+    # DlpPolicy; a tool can never widen its own boundary.
+    dlp_rules: List[str] = field(default_factory=list)
+
+    def register_subprocess(self, pid: int) -> None:
+        self._live_pids.add(pid)
+
+    def unregister_subprocess(self, pid: int) -> None:
+        self._live_pids.discard(pid)
+
+    @property
+    def running_subprocesses(self) -> frozenset:
+        return frozenset(self._live_pids)
 
     def resolve(self, path: str, *, must_exist: bool = False) -> str:
         """Resolve a path and prove it is inside a permitted root.
@@ -88,6 +125,8 @@ class Tool:
     reversible: bool = True
     requires_approval: bool = False   # force approval regardless of policy
     permissions: List[str] = []
+    categories: List[str] = []        # e.g. ["network"] — used for run-level
+                                      # resource accounting (spec §10)
 
     # -- metadata ----------------------------------------------------------
     @classmethod
@@ -101,6 +140,7 @@ class Tool:
             "permissions": cls.permissions,
             "reversible": cls.reversible,
             "requires_approval": cls.requires_approval,
+            "categories": cls.categories,
         }
 
     # -- behaviour ---------------------------------------------------------

@@ -31,9 +31,11 @@ class Schedule:
     id: str = field(default_factory=lambda: new_id("sched"))
     enabled: bool = True
     created: float = field(default_factory=now)
+    created_by: str = ""
     next_run: float = 0.0
     last_run: float = 0.0
     last_status: str = ""
+    last_fired_by: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -43,9 +45,11 @@ class Schedule:
             "cron": self.cron,
             "enabled": self.enabled,
             "created": self.created,
+            "created_by": self.created_by,
             "next_run": self.next_run,
             "last_run": self.last_run,
             "last_status": self.last_status,
+            "last_fired_by": self.last_fired_by,
         }
 
 
@@ -142,11 +146,13 @@ def add_schedule(
     cron: str,
     *,
     enabled: bool = True,
+    created_by: str = "",
 ) -> Schedule:
     parse_cron(cron)  # validate up front
     nxt = next_fire(cron)
     sched = Schedule(
-        worker=worker, procedure=procedure, cron=cron, enabled=enabled, next_run=nxt
+        worker=worker, procedure=procedure, cron=cron, enabled=enabled, next_run=nxt,
+        created_by=created_by,
     )
     store.put("schedules", sched.to_dict(), event="schedule.created")
     return sched
@@ -162,7 +168,7 @@ def get_schedule(store: WorkerStore, sched_id: str) -> Optional[Dict[str, Any]]:
     return store.get("schedules", sched_id)
 
 
-def set_enabled(store: WorkerStore, sched_id: str, enabled: bool) -> None:
+def set_enabled(store: WorkerStore, sched_id: str, enabled: bool, by: str = "") -> None:
     rec = store.get("schedules", sched_id)
     if not rec:
         raise KeyError(sched_id)
@@ -172,7 +178,7 @@ def set_enabled(store: WorkerStore, sched_id: str, enabled: bool) -> None:
     store.put("schedules", rec, event="schedule.updated")
 
 
-def remove_schedule(store: WorkerStore, sched_id: str) -> None:
+def remove_schedule(store: WorkerStore, sched_id: str, by: str = "") -> None:
     rec = store.get("schedules", sched_id)
     if not rec:
         raise KeyError(sched_id)
@@ -191,11 +197,12 @@ def due(store: WorkerStore, window: float = 0.0) -> List[Dict[str, Any]]:
     return out
 
 
-def mark_fired(store: WorkerStore, sched_id: str, status: str) -> None:
+def mark_fired(store: WorkerStore, sched_id: str, status: str, by: str = "") -> None:
     rec = store.get("schedules", sched_id)
     if not rec:
         return
     rec["last_run"] = time.time()
     rec["last_status"] = status
+    rec["last_fired_by"] = by
     rec["next_run"] = next_fire(rec["cron"], after=rec["last_run"])
     store.put("schedules", rec, event="schedule.fired")

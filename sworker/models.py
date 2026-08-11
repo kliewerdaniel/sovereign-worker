@@ -59,16 +59,32 @@ def risk_rank(r: "RiskLevel | str") -> int:
 
 
 class RunStatus(str, Enum):
-    """Failure is a first-class result. There is deliberately no 'unknown'."""
+    """Failure is a first-class result. There is deliberately no 'unknown'.
+
+    The lifecycle a run passes through (spec §12), enforced by
+    ``sworker.statemachine``:
+
+        PENDING -> PLANNING -> EXECUTING -> {AWAITING_APPROVAL} -> VERIFYING
+                 -> SUCCESS | PARTIAL_SUCCESS | FAILED | BLOCKED
+                 | INSUFFICIENT_EVIDENCE | CANCELLED | DENIED
+
+    Terminal states (no outgoing transition): SUCCESS, PARTIAL_SUCCESS, FAILED,
+    BLOCKED, INSUFFICIENT_EVIDENCE, CANCELLED, DENIED.
+    """
 
     PENDING = "PENDING"
+    PLANNING = "PLANNING"
     RUNNING = "RUNNING"
+    EXECUTING = "EXECUTING"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    VERIFYING = "VERIFYING"
     SUCCESS = "SUCCESS"
     PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
     FAILED = "FAILED"
     BLOCKED = "BLOCKED"
-    AWAITING_APPROVAL = "AWAITING_APPROVAL"
     INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    CANCELLED = "CANCELLED"
+    DENIED = "DENIED"
 
 
 class ActionStatus(str, Enum):
@@ -224,6 +240,10 @@ class Observation(Record):
     data: Dict[str, Any] = field(default_factory=dict)
     truncated: bool = False
     duration_ms: int = 0
+    # §44 — if the ingested content (output/data) was flagged as a suspected
+    # prompt-injection attempt, this holds the fired rule name. Empty = benign
+    # (or not scanned). Fail-closed: a hit is recorded, never silently trusted.
+    injection: str = ""
     created: float = field(default_factory=now)
 
 
@@ -285,6 +305,11 @@ class Approval(Record):
     decided_at: float = 0.0
     note: str = ""
     created: float = field(default_factory=now)
+    # §45 HITL escalation / quorum
+    quorum: int = 1               # distinct approvers required before it settles
+    min_role: str = ""            # minimum RBAC role required to cast a vote ("")
+    votes: List[Dict[str, Any]] = field(default_factory=list)  # [{state,by,role,note,at}]
+    escalations: int = 0          # how many times the requirement was raised
 
 
 @dataclass
@@ -297,6 +322,7 @@ class Artifact(Record):
     description: str = ""
     bytes: int = 0
     sha256: str = ""
+    claim_ids: List[str] = field(default_factory=list)  # claims this artifact surfaces
     created: float = field(default_factory=now)
 
 
@@ -320,3 +346,4 @@ class Run(Record):
     artifact_ids: List[str] = field(default_factory=list)
     verifications: List[Dict[str, Any]] = field(default_factory=list)
     seq: int = 0                 # human-facing monotonic number
+    degradations: List[str] = field(default_factory=list)  # §61: surfaced capability losses

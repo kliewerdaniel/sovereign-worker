@@ -1,0 +1,23 @@
+# Sovereign AI Worker Platform — compose stack (local-first, single node)
+#
+# The app serves plain HTTP by design. Terminate TLS at a reverse proxy and
+# never expose 8777 directly to untrusted networks. The bundled web server
+# enforces per-session auth + RBAC + CSRF; it is NOT a substitute for network
+# isolation.
+services:
+  sworker:
+    build: .
+    image: sworker:latest
+    container_name: sworker
+    restart: unless-stopped
+    environment:
+      SWORKER_HOME: /data
+      SWORKER_ADMIN: admin
+      SWORKER_ADMIN_PASSWORD: changeme   # change before any real use
+    ports:
+      - "127.0.0.1:8777:8777"             # bind to localhost; front with TLS proxy
+    volumes:
+      - sworker-data:/data
+
+volumes:
+  sworker-data:

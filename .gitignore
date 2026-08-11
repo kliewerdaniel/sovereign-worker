@@ -3,9 +3,15 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+*.egg-info/
+build/
 
 # Runtime worker state (per-workspace audit/sqlite/artifacts)
 .state/
+
+# Secrets (never commit key material)
+*.key
+secrets.key
 
 # OS
 .DS_Store
