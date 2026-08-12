@@ -161,7 +161,7 @@ def render_index(store: WorkerStore, ws, current_user: str = "", role: str = "")
     )
 
 
-def render_sales(store: WorkerStore, ws, role: str = "") -> str:
+def render_sales(store: WorkerStore, ws, role: str = "", lead_id: str = "") -> str:
     """§71 — sales operating-system overview page (read-only view of the ledger)."""
     try:
         from .sales.repository import SalesRepository, default_ledger_path
@@ -179,10 +179,32 @@ def render_sales(store: WorkerStore, ws, role: str = "") -> str:
                 repo, targets=targets, targets_source=root or "", day=""
             )
             summary = repo.pipeline_summary()
+            leads = repo.search_leads(limit=200)
         finally:
             repo.close()
     except Exception as e:  # pragma: no cover
-        report, summary = {"error": str(e)}, []
+        report, summary, leads = {"error": str(e)}, [], []
+    # Lead list table (links to the per-lead detail view).
+    lrows = "".join(
+        f"<tr><td><a href='/sales/lead/{_esc(l['id'])}'>{_esc(l['id'])}</a></td>"
+        f"<td>{_esc(l.get('company_name', ''))}</td>"
+        f"<td>{_esc(l.get('industry', ''))}</td>"
+        f"<td>{_esc(l.get('stage', ''))}</td>"
+        f"<td>{l.get('score', 0)}</td></tr>"
+        for l in leads
+    ) or "<tr><td colspan=5><i>no leads</i></td></tr>"
+    # Worker runs (sales workers only) — reuse the same store the dashboard reads.
+    runs = [r for r in store.find("runs", order="seq", desc=True)
+            if (r.get("worker") or "").startswith("sales_")][:25]
+    rrows = "".join(
+        f"<tr><td>#{r.get('seq', '')}</td><td><code>{_esc(r['id'])}</code></td>"
+        f"<td>{_esc(r.get('worker', ''))}</td>"
+        f"<td>{_status_pill(r.get('status', ''))}</td>"
+        f"<td><a href='/run?run_id={_esc(r['id'])}'>view</a></td></tr>"
+        for r in runs
+    ) or "<tr><td colspan=5><i>no sales runs yet</i></td></tr>"
+    if lead_id:
+        return _render_sales_lead(store, ws, role, lead_id)
     plines = "".join(
         f"<tr><td>{_esc(s.get('stage', ''))}</td><td>{s.get('count', 0)}</td></tr>"
         for s in summary
@@ -202,10 +224,61 @@ def render_sales(store: WorkerStore, ws, role: str = "") -> str:
         f"<p>Daily minimums: <b style='color:{'#e07' if failed else '#7c7'}'>{_esc(badge)}</b></p>"
         f"<h2>Pipeline by stage</h2><table><tr><th>stage</th><th>leads</th></tr>{plines}</table>"
         f"<h2>Activity vs targets</h2><table><tr><th>metric</th><th>actual</th><th>target</th><th>met</th></tr>{vrows}</table>"
+        f"<h2>Leads ({len(leads)})</h2><table><tr><th>id</th><th>company</th><th>industry</th><th>stage</th><th>score</th></tr>{lrows}</table>"
+        f"<h2>Sales worker runs</h2><table><tr><th>#</th><th>id</th><th>worker</th><th>status</th><th></th></tr>{rrows}</table>"
         f"<p style='color:#8a93a3'>JSON: <a href='/api/v1/sales/metrics'>/api/v1/sales/metrics</a> · "
         f"<a href='/api/v1/sales/pipeline'>/api/v1/sales/pipeline</a> · "
         f"<a href='/api/v1/sales/verify'>/api/v1/sales/verify</a></p>"
         f"<p style='color:#8a93a3'>Autonomous loop: <code>python -m sworker run sales_researcher \"execute DAILY_SALES_RUN\"</code></p>"
+    )
+
+
+def _render_sales_lead(store: WorkerStore, ws, role: str, lead_id: str) -> str:
+    """Per-lead detail (read-only) — evidence + qualifications + drafts + history."""
+    from .sales.repository import SalesRepository, default_ledger_path
+
+    repo = SalesRepository(default_ledger_path())
+    try:
+        lead = repo.get_lead(lead_id)
+        if not lead:
+            return page("Lead not found", f"<p>No lead <code>{_esc(lead_id)}</code>.</p>"
+                                      f"<p><a href='/sales'>back</a></p>")
+        ld = lead.to_dict()
+        ev = [e.to_dict() for e in repo.evidence_for(lead_id)]
+        quals = [q.to_dict() for q in repo.qualifications_for(lead_id)]
+        pp = [p.to_dict() for p in repo.pain_points_for(lead_id)]
+        drafts = [d.to_dict() for d in repo.drafts(lead_id=lead_id)]
+        hist = [h.to_dict() for h in repo.stage_history(lead_id)]
+    finally:
+        repo.close()
+    ev_rows = "".join(
+        f"<tr><td>{_esc(e.get('claim_type', ''))}</td><td>{_esc(str(e.get('claim_text', ''))[:80])}</td>"
+        f"<td><code>{_esc(str(e.get('source_ref', '')))}</code></td><td>{_esc(e.get('tier', ''))}</td></tr>"
+        for e in ev
+    ) or "<tr><td colspan=4><i>no evidence</i></td></tr>"
+    q_rows = "".join(
+        f"<tr><td>{q.get('score', 0)}</td><td>{_esc(q.get('tier', ''))}</td><td>v{q.get('version', 0)}</td></tr>"
+        for q in quals
+    ) or "<tr><td colspan=3><i>not qualified</i></td></tr>"
+    d_rows = "".join(
+        f"<tr><td>{_esc(d.get('state', ''))}</td><td>{_esc(str(d.get('subject', ''))[:50])}</td></tr>"
+        for d in drafts
+    ) or "<tr><td colspan=2><i>no drafts</i></td></tr>"
+    h_rows = "".join(
+        f"<tr><td>{_esc(h.get('from_stage', ''))}</td><td>{_esc(h.get('to_stage', ''))}</td>"
+        f"<td>{_esc(h.get('reason', ''))}</td></tr>"
+        for h in hist
+    ) or "<tr><td colspan=3><i>no stage history</i></td></tr>"
+    return (
+        f"<span class=bar><a href='/sales'>← all leads</a> · role={_esc(role)}</span>"
+        f"<h2>Lead {_esc(lead_id)} — {_esc(ld.get('company_id', ''))}</h2>"
+        f"<p>stage: <b>{_esc(str(ld.get('stage', '')))}</b> · score: {ld.get('score', 0)}</p>"
+        f"<h2>Evidence ({len(ev)})</h2><table><tr><th>type</th><th>claim</th><th>source_ref</th><th>tier</th></tr>{ev_rows}</table>"
+        f"<h2>Qualifications ({len(quals)})</h2><table><tr><th>score</th><th>tier</th><th>version</th></tr>{q_rows}</table>"
+        f"<h2>Pain points ({len(pp)})</h2><pre>{_esc(str(pp))}</pre>"
+        f"<h2>Drafts ({len(drafts)})</h2><table><tr><th>state</th><th>subject</th></tr>{d_rows}</table>"
+        f"<h2>Stage history</h2><table><tr><th>from</th><th>to</th><th>reason</th></tr>{h_rows}</table>"
+        f"<p style='color:#8a93a3'>JSON: <a href='/api/v1/sales/lead/{_esc(lead_id)}'>/api/v1/sales/lead/{_esc(lead_id)}</a></p>"
     )
 
 
@@ -807,6 +880,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(page("Procedures", render_procedures(self._store, self._ws, role)))
             elif url.path == "/sales":  # §71
                 self._send(page("Daily Sales OS", render_sales(self._store, self._ws, role)))
+            elif url.path.startswith("/sales/lead/"):  # §71 per-lead detail
+                lid = url.path[len("/sales/lead/"):]
+                self._send(page(f"Lead {lid}", render_sales(self._store, self._ws, role, lead_id=lid)))
             # --- §37 /api/v1 (versioned, hardened JSON) -----------------------------
             elif url.path == "/api/v1/openapi.json":
                 self._send_json(openapi_doc())
