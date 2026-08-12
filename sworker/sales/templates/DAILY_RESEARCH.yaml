@@ -1,0 +1,41 @@
+name: DAILY_RESEARCH
+intent: >-
+  Execute the daily research minimums locally: discover candidates, research them,
+  record evidence + pain points, and qualify every lead deterministically — every
+  claim traceable to a source. No drafting, scheduling, or sending (those are gated
+  to the outreach worker and the operator).
+inputs:
+  - source: candidates.csv        # permitted candidate file under company/, or "prospects"
+  - limit: 20                     # daily minimum: 20 prospects researched+added
+  - day: ""                       # report day (empty = today)
+steps:
+  - description: Discover up to {{limit}} candidate companies from {{source}}, dedupe, record provenance
+    tool: sales_discover
+    args:
+      source: "{{source}}"
+      limit: "{{limit}}"
+  - description: Research every discovered lead from permitted company sources (evidence + pain points)
+    tool: sales_research
+    args:
+      lead_id: "all"
+  - description: Qualify every researched lead deterministically from its evidence (append-only score)
+    tool: sales_qualify
+    args:
+      lead_id: "all"
+  - description: Produce the daily sales report against the documented targets
+    tool: sales_metrics
+    args:
+      day: "{{day}}"
+      markdown: true
+verification:
+  - check: sales_evidence_has_source
+  - check: sales_pipeline_legal
+  - check: sales_score_recomputes
+  - check: sales_metrics_match_ledger
+    day: "{{day}}"
+notes: |-
+  Owned and versioned by the sales_researcher worker (procedures publish/rollback).
+  The discovery/research/qualify portion of the daily loop only — outreach,
+  follow-up scheduling, and sending live in DAILY_SALES_RUN (sales_outreach) and are
+  gated behind human approval. The "all" lead_id tells the tools to iterate over
+  every lead in the ledger without a language model driving the loop.

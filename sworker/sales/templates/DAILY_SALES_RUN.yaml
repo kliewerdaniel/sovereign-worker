@@ -1,0 +1,40 @@
+name: DAILY_SALES_RUN
+intent: >-
+  Execute the daily outreach minimums locally: draft personalised outreach for
+  qualified leads, schedule the documented follow-up, prepare approved drafts, and
+  report against the documented daily targets. Every external send stays in `draft`
+  until the operator approves it and the EXTERNAL risk tier is cleared.
+inputs:
+  - lead_id: ""                   # specific lead, or "" to operate over contacted/responded leads
+  - day: ""                       # report day (empty = today)
+steps:
+  - description: Draft a personalised outreach message for each qualified lead (stays 'draft', needs approval)
+    tool: sales_draft_outreach
+    args:
+      lead_id: "{{lead_id}}"
+  - description: Schedule the documented next action for each contacted/responded lead
+    tool: sales_schedule_followup
+    args:
+      lead_id: "{{lead_id}}"
+  - description: Move each reached lead to the contacted stage (legal transition only)
+    tool: sales_move_stage
+    args:
+      lead_id: "{{lead_id}}"
+      to_stage: contacted
+      reason: "daily outreach drafted (send pending approval)"
+  - description: Produce the daily sales report against the documented targets
+    tool: sales_metrics
+    args:
+      day: "{{day}}"
+      markdown: true
+verification:
+  - check: sales_outreach_approved_first
+  - check: sales_pipeline_legal
+  - check: sales_metrics_match_ledger
+    day: "{{day}}"
+notes: |-
+  Owned and versioned by the sales_outreach worker (procedures publish/rollback).
+  The drafting/scheduling/move portion of the daily loop only. Discovery, research,
+  and qualification live in DAILY_RESEARCH (sales_researcher). No SEND happens inside
+  a procedure: sales_record_sent requires an operator approval on the EXTERNAL tier,
+  so egress is always human-gated.
