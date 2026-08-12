@@ -441,6 +441,88 @@ def cmd_audit(args) -> int:
     return 0
 
 
+def cmd_inspect(args) -> int:
+    """§39 — concise execution timeline for a run, inspectable by design.
+
+    Walks RUN -> ACTION -> TOOL -> OBSERVATION -> EVIDENCE -> VERIFICATION ->
+    ARTIFACT -> APPROVAL without the user reading SQLite by hand. Built from the
+    persisted store records (ordered by their `created` timestamp), not the raw
+    audit log, so each entry is a human-facing fact rather than an event name.
+    """
+    store = _store()
+    run = store.get("runs", args.run_id)
+    if not run:
+        for r in store.find("runs", order="seq"):
+            if str(r["seq"]) == args.run_id:
+                run = r
+                break
+    if not run:
+        print(f"no run {args.run_id!r}", file=sys.stderr)
+        return 1
+
+    rid = run["id"]
+    steps = store.find("steps", run_id=rid, order="created")
+    actions = store.find("actions", run_id=rid, order="created")
+    obss = store.find("observations", run_id=rid, order="created")
+    evs = store.find("evidence", run_id=rid, order="created")
+    vers = store.find("verifications", run_id=rid, order="created")
+    arts = store.find("artifacts", run_id=rid, order="created")
+    apps = store.find("approvals", run_id=rid, order="created")
+
+    # Merge into one timeline keyed by creation time.
+    tl: List[tuple] = []
+    for s in steps:
+        tl.append((s.get("created", 0), "STEP", f"[{s.get('status','')}] {s.get('description','')[:70]}"))
+    for a in actions:
+        tl.append((a.get("created", 0), "ACTION",
+                   f"{a.get('tool','')} [{a.get('risk','')}] {a.get('status','')}"))
+    for o in obss:
+        flag = "ok" if o.get("ok") else "FAIL"
+        tl.append((o.get("created", 0), "OBSERVATION", f"{flag} {o.get('output','')[:70]}"))
+    for e in evs:
+        tl.append((e.get("created", 0), "EVIDENCE",
+                   f"({e.get('provenance','')}) {e.get('summary','')[:70]}  src={e.get('source_ref','')}"))
+    for v in vers:
+        tl.append((v.get("created", 0), "VERIFY", f"{v.get('check','')} {v.get('outcome','')}"))
+    for a in arts:
+        tl.append((a.get("created", 0), "ARTIFACT", f"{a.get('title','') or a.get('kind','')} {a.get('path','')}"))
+    for a in apps:
+        tl.append((a.get("created", 0), "APPROVAL",
+                   f"[{a.get('risk','')}] {a.get('state','')} {a.get('summary','')[:60]}"))
+
+    tl.sort(key=lambda t: t[0])
+    pending = ApprovalManager(store).pending(rid)
+
+    if _wants_json(args):
+        _jprint({
+            "id": rid,
+            "seq": run.get("seq"),
+            "worker": run["worker"],
+            "status": run["status"],
+            "intent": run.get("intent", ""),
+            "summary": run.get("summary", ""),
+            "timeline": [
+                {"kind": k, "text": t} for _, k, t in tl
+            ],
+            "pending_approvals": pending,
+        })
+        return 0
+
+    print(f"RUN {rid}")
+    print(f"  worker: {run['worker']}")
+    print(f"  status: {run['status']}")
+    if run.get("intent"):
+        print(f"  intent: {run['intent']}")
+    print()
+    for i, (_, k, t) in enumerate(tl, 1):
+        print(f"  {i:02d} {k:<11} {t}")
+    if pending:
+        print("\nPENDING APPROVALS:")
+        for a in pending:
+            print(f"  - [{a['risk']}] {a['summary']}  (evidence: {len(a.get('evidence_ids', []))})")
+    return 0
+
+
 def cmd_learn(args) -> int:
     store = _store()
     body = learn_from_run(store, args.run_id, args.name)
@@ -1356,6 +1438,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     au = sub.add_parser("audit", help="replay event log for a run")
     au.add_argument("run_id"); au.add_argument("--json", action="store_true"); au.set_defaults(func=cmd_audit)
+
+    ins = sub.add_parser("inspect", help="§39 concise execution timeline for a run")
+    ins.add_argument("run_id"); ins.add_argument("--json", action="store_true"); ins.set_defaults(func=cmd_inspect)
 
     l = sub.add_parser("learn", help="capture a run as a procedure")
     l.add_argument("run_id"); l.add_argument("name"); l.set_defaults(func=cmd_learn)
