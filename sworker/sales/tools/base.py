@@ -337,14 +337,37 @@ class SalesMoveStageTool(Tool):
             "to_stage": {"type": "string"},
             "reason": {"type": "string", "default": ""},
         },
-        "required": ["lead_id", "to_stage"],
+        "required": ["to_stage"],
     }
 
     def run(self, ctx, args):
         repo = _repo(ctx)
+        to_stage = args.get("to_stage", "")
+        if not to_stage:
+            return ToolResult(ok=False, error="sales_move_stage: missing required 'to_stage'")
+        lead_id = (args.get("lead_id") or "").strip()
+        if lead_id in ("", "all"):
+            leads = repo.search_leads(min_score=0.0, limit=200)
+            if not leads:
+                return ToolResult(ok=True, output="no qualified leads to move", data={"moved": []})
+            out = []
+            for ld in leads:
+                try:
+                    mv = repo.move_stage(
+                        ld["id"], to_stage, reason=args.get("reason", ""),
+                        run_id=ctx.run_id, worker=ctx.worker,
+                    )
+                    out.append({"lead_id": ld["id"], "ok": True, "to": mv["to"]})
+                except SalesError as exc:
+                    out.append({"lead_id": ld["id"], "ok": False, "error": str(exc)})
+            moved = [o for o in out if o.get("ok")]
+            return ToolResult(
+                ok=True, output=f"moved {len(moved)}/{len(out)} qualified lead(s) -> {to_stage}",
+                data={"moved": out},
+            )
         try:
             mv = repo.move_stage(
-                args["lead_id"], args["to_stage"], reason=args.get("reason", ""),
+                lead_id, to_stage, reason=args.get("reason", ""),
                 run_id=ctx.run_id, worker=ctx.worker,
             )
         except SalesError as exc:
@@ -364,7 +387,7 @@ class SalesDraftOutreachTool(Tool):
             "contact_id": {"type": "string", "default": ""},
             "use_model": {"type": "boolean", "default": False},
         },
-        "required": ["lead_id"],
+        "required": [],
     }
 
     def run(self, ctx, args):
@@ -376,9 +399,32 @@ class SalesDraftOutreachTool(Tool):
             from ...inference import Inference
 
             inference = Inference()
+        lead_id = (args.get("lead_id") or "").strip()
+        # Empty / "all" => every qualified lead (the daily procedure's default).
+        if lead_id in ("", "all"):
+            leads = repo.search_leads(min_score=0.0, limit=200)
+            if not leads:
+                return ToolResult(ok=True, output="no qualified leads to draft for", data={"drafts": []})
+            out = []
+            for ld in leads:
+                try:
+                    res = O.prepare(
+                        repo, ld["id"], sequences=sequences, offer=offer,
+                        channel=args.get("channel", "email"), contact_id=args.get("contact_id", ""),
+                        run_id=ctx.run_id, inference=inference,
+                    )
+                    out.append({"lead_id": ld["id"], "ok": True, "draft_id": res["draft"].get("id")})
+                except ValueError as exc:
+                    out.append({"lead_id": ld["id"], "ok": False, "error": str(exc)})
+            made = [o for o in out if o.get("ok")]
+            return ToolResult(
+                ok=True,
+                output=f"drafted {len(made)}/{len(out)} qualified lead(s)",
+                data={"drafts": out},
+            )
         try:
             result = O.prepare(
-                repo, args["lead_id"], sequences=sequences, offer=offer,
+                repo, lead_id, sequences=sequences, offer=offer,
                 channel=args.get("channel", "email"), contact_id=args.get("contact_id", ""),
                 run_id=ctx.run_id, inference=inference,
             )
@@ -386,7 +432,7 @@ class SalesDraftOutreachTool(Tool):
             return ToolResult(ok=False, error=str(exc))
         return ToolResult(
             ok=True,
-            output=f"drafted {result['draft']['channel']} for {args['lead_id']}; "
+            output=f"drafted {result['draft']['channel']} for {lead_id}; "
             f"model_rewrite={'used' if result['model']['used'] else 'not used'}",
             data=result,
         )
@@ -399,13 +445,28 @@ class SalesScheduleFollowupTool(Tool):
     input_schema = {
         "type": "object",
         "properties": {"lead_id": {"type": "string"}},
-        "required": ["lead_id"],
+        "required": [],
     }
 
     def run(self, ctx, args):
         repo = _repo(ctx)
         sequences = K.parse_followup_sequences(K.docs_root(ctx.workspace))
-        result = F.schedule_for_lead(repo, args["lead_id"], sequences=sequences, run_id=ctx.run_id)
+        lead_id = (args.get("lead_id") or "").strip()
+        if lead_id in ("", "all"):
+            leads = repo.search_leads(min_score=0.0, limit=200)
+            if not leads:
+                return ToolResult(ok=True, output="no qualified leads to schedule", data={"scheduled": []})
+            out = []
+            for ld in leads:
+                res = F.schedule_for_lead(repo, ld["id"], sequences=sequences, run_id=ctx.run_id)
+                out.append({"lead_id": ld["id"], "created": res.get("created", False),
+                            "reason": res.get("reason", "")})
+            made = [o for o in out if o.get("created")]
+            return ToolResult(
+                ok=True, output=f"scheduled {len(made)}/{len(out)} qualified lead(s)",
+                data={"scheduled": out},
+            )
+        result = F.schedule_for_lead(repo, lead_id, sequences=sequences, run_id=ctx.run_id)
         return ToolResult(ok=True, output=str(result["reason"]), data=result)
 
 

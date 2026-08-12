@@ -16,6 +16,8 @@ instructions: |-
 tools:
   - sales_draft_outreach
   - sales_schedule_followup
+  - sales_move_stage
+  - sales_metrics
   - sales_approve_draft
   - sales_record_sent
   - sales_pipeline_list

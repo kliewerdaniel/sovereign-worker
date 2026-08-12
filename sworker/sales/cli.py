@@ -9,6 +9,7 @@ YAMLs + the ``DAILY_SALES_RUN`` procedure (invoked via ``sworker run``).
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -39,6 +40,52 @@ def _sales_docs_root() -> str:
 
 def _jprint(obj: Any) -> None:
     print(json.dumps(obj, indent=2, default=str))
+
+
+# --------------------------------------------------------------------------- #
+# seed — Phase 11: deterministic demo data so the success demo needs no private
+# data or live APIs. Idempotent; writes only into the workspace company/ dir.
+# --------------------------------------------------------------------------- #
+_DEMO_CANDIDATES = [
+    {"name": "Acme Robotics", "website": "https://acme-robotics.example",
+     "industry": "Manufacturing", "notes": "Cited DailySalesOS ICP: mid-market manufacturer."},
+    {"name": "Globex Analytics", "website": "https://globex.example",
+     "industry": "SaaS", "notes": "Analytics platform; buying signals in sourcing doc."},
+    {"name": "Initech Tools", "website": "https://initech.example",
+     "industry": "Manufacturing", "notes": "Tooling supplier expanding sales ops."},
+]
+
+
+def cmd_seed(args) -> int:
+    """Materialise a deterministic demo company + candidate list.
+
+    Pure, offline, and reproducible: running it twice yields byte-identical
+    files. This is what makes ``sworker sales daily-run`` demonstrable from a
+    clean environment without private CRMs or live APIs.
+    """
+    ws = default_workspace()
+    ws.ensure()
+    company = ws.company_dir
+    os.makedirs(company, exist_ok=True)
+    csv_path = os.path.join(company, args.csv_name)
+    with open(csv_path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=["name", "website", "industry", "notes"])
+        w.writeheader()
+        for row in _DEMO_CANDIDATES:
+            w.writerow(row)
+    # A minimal company-knowledge doc so research has something to read.
+    kdoc = os.path.join(company, "acme_robotics.md")
+    with open(kdoc, "w") as fh:
+        fh.write(
+            "# Acme Robotics — Company Knowledge\n\n"
+            "Mid-market manufacturer automating shop-floor operations.\n"
+            "Pain points: manual lead routing, no single source of pipeline truth.\n"
+            "Buying intent: evaluating sales OS after a Q3 expansion.\n"
+        )
+    print(f"seeded: {csv_path} ({len(_DEMO_CANDIDATES)} candidates)")
+    print(f"seeded: {kdoc}")
+    print("next:   python -m sworker sales daily-run --source " + args.csv_name)
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -188,6 +235,130 @@ def cmd_verify(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# daily-run — Phase 8 flagship workflow
+# --------------------------------------------------------------------------- #
+def cmd_daily_run(args) -> int:
+    """§8 — the Sales Worker's daily run, orchestrated through the runtime.
+
+    This is NOT a second agent framework. It runs the two worker instances that
+    already exist (``sales_researcher`` and ``sales_outreach``) through the same
+    ``WorkerEngine`` any other worker would use, then consolidates their reports.
+
+        worker load -> knowledge load -> pipeline inspect -> qualify ->
+        recommended actions -> policy respects external egress -> approval gate
+
+    External egress (``sales_record_sent`` / ``sales_bulk_send``) is never
+    executed inside the loop; it surfaces as a PENDING APPROVAL the operator
+    resolves with ``sworker approve``.
+    """
+    from ..config import get_worker
+    from ..engine import WorkerEngine
+    from ..store import WorkerStore  # noqa: F401  (engine owns the store)
+
+    store = WorkerStore(default_workspace().state_dir)
+    plan: List[Dict[str, Any]] = []
+
+    # 1) Research pass (discover + research + qualify). No external egress.
+    try:
+        w = get_worker("sales_researcher")
+        eng = WorkerEngine(w, store)
+        res = eng.run(
+            "execute DAILY_RESEARCH",
+            procedure="DAILY_RESEARCH",
+            inputs={"source": args.source, "limit": str(args.limit)},
+            on_event=_printer,
+        )
+        plan.append({
+            "worker": "sales_researcher",
+            "run_id": res.run.id,
+            "status": res.status.value,
+            "summary": res.summary,
+            "ok": "yes" if res.ok else "no",
+            "pending": [a["id"] for a in res.pending_approvals],
+        })
+    except Exception as exc:  # a failed research pass still reports, it does not crash the daily run
+        plan.append({"worker": "sales_researcher", "run_id": "", "status": "ERROR",
+                     "summary": str(exc), "ok": "no", "pending": []})
+
+    # 2) Outreach pass (draft + schedule + move stage). Holds for approval before send.
+    try:
+        w = get_worker("sales_outreach")
+        eng = WorkerEngine(w, store)
+        res = eng.run(
+            "execute DAILY_SALES_RUN",
+            procedure="DAILY_SALES_RUN",
+            inputs={},
+            on_event=_printer,
+        )
+        plan.append({
+            "worker": "sales_outreach",
+            "run_id": res.run.id,
+            "status": res.status.value,
+            "summary": res.summary,
+            "ok": "yes" if res.ok else "no",
+            "pending": [a["id"] for a in res.pending_approvals],
+        })
+        pending = res.pending_approvals
+    except Exception as exc:
+        plan.append({"worker": "sales_outreach", "run_id": "", "status": "ERROR",
+                     "summary": str(exc), "ok": "no", "pending": []})
+        pending = []
+
+    # 3) Consolidated daily report straight from the ledger (re-derivable).
+    try:
+        repo = _repo()
+        parsed = sales_knowledge.parse_daily_targets(_sales_docs_root())
+        report = sales_metrics.daily_report(
+            repo, targets=parsed.get("targets", {}), targets_source=parsed.get("source_doc", "")
+        )
+        print()
+        print("=" * 64)
+        print("DAILY SALES REPORT")
+        print("=" * 64)
+        print(f"date:          {report['date']}")
+        print(f"failed_sales_day: {report['failed_sales_day']}")
+        for tkey, v in report["vs_target"].items():
+            flag = "MET" if v["met"] else "MISS"
+            print(f"  {flag:4} {tkey:22} {v['actual']}/{v['target']}")
+        if report["bottlenecks"]:
+            print("bottlenecks:")
+            for b in report["bottlenecks"]:
+                print(f"  - {b}")
+        print(f"pending_approvals: {report['pending_approvals']}")
+    except Exception as exc:
+        print(f"\n(daily report unavailable: {exc})")
+
+    # 4) Show the inspect + approval surface so the operator can finish the loop.
+    print()
+    print("-" * 64)
+    print("PER-RUN SUMMARY")
+    for p in plan:
+        print(f"  {p['worker']:18} {p['status']:16} ok={p['ok']}")
+        if p["run_id"]:
+            print(f"    inspect: sworker inspect {p['run_id']}")
+            print(f"    replay:  sworker replay {p['run_id']}")
+    if pending:
+        print()
+        print("EXTERNAL EGRESS HELD FOR APPROVAL:")
+        for a in pending:
+            print(f"  {a['id']}  {a['summary']}  [{a['risk']}]")
+        print("  approve with: sworker approve <id>")
+        print("  then resume: sworker resume <run_id>")
+    return 0
+
+
+def _printer(event: str, payload: Dict[str, Any]) -> None:
+    if event in ("run.started", "run.finished", "plan.created"):
+        return
+    if event == "step.done":
+        print(f"  ✓ {payload.get('step','')[:58]}  ({payload.get('tool')})")
+    elif event == "step.failed":
+        print(f"  ✗ {payload.get('step','')[:58]}  ERROR: {payload.get('error','')[:70]}")
+    elif event == "approval.requested":
+        print(f"  ⏳ approval requested: {payload.get('id')} [{payload.get('risk')}] {payload.get('summary')}")
+
+
+# --------------------------------------------------------------------------- #
 # templates — list bundled worker YAMLs + DAILY_SALES_RUN
 # --------------------------------------------------------------------------- #
 def cmd_templates(args) -> int:
@@ -205,6 +376,10 @@ def build_subparser(sub) -> None:
     p = sales_sub.add_parser("init", help="install sales worker templates + compile ICP")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)
+
+    p = sales_sub.add_parser("seed", help="§11 materialise deterministic demo candidates + knowledge")
+    p.add_argument("--csv-name", default="candidates.csv")
+    p.set_defaults(func=cmd_seed)
 
     p = sales_sub.add_parser("icp", help="show / recompile the active ICP")
     p.add_argument("--recompile", action="store_true")
@@ -230,3 +405,8 @@ def build_subparser(sub) -> None:
 
     p = sales_sub.add_parser("templates", help="list bundled worker + procedure templates")
     p.set_defaults(func=cmd_templates)
+
+    p = sales_sub.add_parser("daily-run", help="§8 run the Sales Worker's full daily loop")
+    p.add_argument("--source", default="candidates.csv")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_daily_run)
