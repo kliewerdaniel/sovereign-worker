@@ -439,6 +439,13 @@ class WorkerEngine:
                         },
                     }
                 )
+        # Closed-world: never plan a tool the worker is not allowed to run.
+        for s in steps:
+            tool = s.get("tool")
+            if tool and not self.registry.has(str(tool)):
+                s["description"] = f"[unavailable tool {tool}] {s.get('description','')}"
+                s["tool"] = ""
+                s["args"] = {}
         return (f"(no language model available) retrieve company context for: {request}", steps)
 
     @staticmethod

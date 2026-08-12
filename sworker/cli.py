@@ -49,6 +49,7 @@ from .approvals import ApprovalManager, ApprovalError
 from .procedures import learn_from_run, list_procedures, load_procedure, save_procedure
 from . import scheduler as sched_mod
 from . import web as web_mod
+from .sales import cli as sales_cli  # §71 — local-first sales operating system
 from .auth import AuthProvider
 from .rbac import RBAC
 from .policy import PolicyStore
@@ -177,7 +178,7 @@ def cmd_run(args) -> int:
     worker = get_worker(args.worker)
     eng = _engine(worker)
     store = eng.store
-    res = eng.run(args.request, inputs=_inputs(args), on_event=_printer)
+    res = eng.run(args.request, procedure=getattr(args, "procedure", "") or "", inputs=_inputs(args), on_event=_printer)
     print()
     print("=" * 64)
     print(f"RUN #{res.run.seq}  {res.status.value}")
@@ -1331,6 +1332,7 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="run a request")
     r.add_argument("worker"); r.add_argument("request")
     r.add_argument("-i", "--input", action="append", help="key=value run inputs")
+    r.add_argument("-p", "--procedure", default="", help="named procedure to execute (honored over free-text planning)")
     r.set_defaults(func=cmd_run)
 
     a = sub.add_parser("approve", help="approve a pending approval")
@@ -1535,6 +1537,9 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--host", default="127.0.0.1")
     w.add_argument("--home", default=None)
     w.set_defaults(func=cmd_web)
+
+    # --- §71 local-first sales operating system -------------------------------
+    sales_cli.build_subparser(sub)
 
     # --- Phase 1 security subsystems ----------------------------------------
     usr = sub.add_parser("user", help="manage local users (auth/RBAC)")

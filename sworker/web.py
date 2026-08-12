@@ -161,6 +161,54 @@ def render_index(store: WorkerStore, ws, current_user: str = "", role: str = "")
     )
 
 
+def render_sales(store: WorkerStore, ws, role: str = "") -> str:
+    """§71 — sales operating-system overview page (read-only view of the ledger)."""
+    try:
+        from .sales.repository import SalesRepository, default_ledger_path
+        from .sales import metrics as sales_metrics
+        from .sales import knowledge as sales_knowledge
+
+        repo = SalesRepository(default_ledger_path())
+        try:
+            root = os.environ.get("DAILYSALESOS_ROOT", "")
+            if not (root and os.path.isdir(root)):
+                root = os.path.join(ws.root, "sales_knowledge")
+                root = root if os.path.isdir(root) else ""
+            targets = sales_knowledge.parse_daily_targets(root) if root else {}
+            report = sales_metrics.daily_report(
+                repo, targets=targets, targets_source=root or "", day=""
+            )
+            summary = repo.pipeline_summary()
+        finally:
+            repo.close()
+    except Exception as e:  # pragma: no cover
+        report, summary = {"error": str(e)}, []
+    plines = "".join(
+        f"<tr><td>{_esc(s.get('stage', ''))}</td><td>{s.get('count', 0)}</td></tr>"
+        for s in summary
+    ) or "<tr><td colspan=2><i>no leads</i></td></tr>"
+    vt = report.get("vs_target", {})
+    vrows = "".join(
+        f"<tr><td>{_esc(k)}</td><td>{v.get('actual', 0)}</td><td>{v.get('target', 0)}</td>"
+        f"<td>{'✓' if v.get('met') else '✗'}</td></tr>"
+        for k, v in vt.items()
+    ) or "<tr><td colspan=4><i>no targets loaded</i></td></tr>"
+    failed = report.get("failed_sales_day")
+    badge = "FAILED SALES DAY" if failed else ("OK" if failed is False else "—")
+    return (
+        f"<span class=bar>role={_esc(role)} · <a href='/'>home</a> · "
+        f"<a href='/dashboard'>dashboard</a> · <a href='/procedures'>procedures</a></span>"
+        f"<h2>Daily Sales OS — {_esc(report.get('date', ''))}</h2>"
+        f"<p>Daily minimums: <b style='color:{'#e07' if failed else '#7c7'}'>{_esc(badge)}</b></p>"
+        f"<h2>Pipeline by stage</h2><table><tr><th>stage</th><th>leads</th></tr>{plines}</table>"
+        f"<h2>Activity vs targets</h2><table><tr><th>metric</th><th>actual</th><th>target</th><th>met</th></tr>{vrows}</table>"
+        f"<p style='color:#8a93a3'>JSON: <a href='/api/v1/sales/metrics'>/api/v1/sales/metrics</a> · "
+        f"<a href='/api/v1/sales/pipeline'>/api/v1/sales/pipeline</a> · "
+        f"<a href='/api/v1/sales/verify'>/api/v1/sales/verify</a></p>"
+        f"<p style='color:#8a93a3'>Autonomous loop: <code>python -m sworker run sales_researcher \"execute DAILY_SALES_RUN\"</code></p>"
+    )
+
+
 def render_dashboard(store: WorkerStore, ws, role: str = "") -> str:
     """§27 — consolidated admin dashboard (no secrets surfaced)."""
     runs = store.find("runs", order="seq", desc=True)
@@ -701,6 +749,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(page("Maturity", render_maturity(self._store, self._ws, role)))
             elif url.path == "/procedures":  # §23
                 self._send(page("Procedures", render_procedures(self._store, self._ws, role)))
+            elif url.path == "/sales":  # §71
+                self._send(page("Daily Sales OS", render_sales(self._store, self._ws, role)))
             # --- §37 /api/v1 (versioned, hardened JSON) -----------------------------
             elif url.path == "/api/v1/openapi.json":
                 self._send_json(openapi_doc())
@@ -949,6 +999,10 @@ def _api_v1_dispatch(handler: "Handler", url: "Any", qs: "dict") -> "tuple[Any, 
     """§37 — route /api/v1/* to a handler, returning (body, status)."""
     path = url.path[len("/api/v1"):]  # strip prefix; leading "/" remains
     store = handler._store
+    if path.startswith("/sales"):
+        from .sales import web as sales_web
+
+        return sales_web.dispatch(path[len("/sales"):], qs)
     if path == "/health" or path == "":
         return _doctor.run_doctor(handler._ws), 200
     if path == "/workers":
