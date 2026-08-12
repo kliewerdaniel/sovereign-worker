@@ -15,3 +15,6 @@ secrets.key
 
 # OS
 .DS_Store
+
+# Runtime worker ledger data (created under SWORKER_HOME during runs)
+company/
