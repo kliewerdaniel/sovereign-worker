@@ -121,3 +121,9 @@ explicitly performs egress (HTTP, `git push`, or an EXTERNAL subprocess).
   security policy — treat it like code (it lives in version control).
 - Not a guarantee against a *compromised dependency*. The core has zero
   third-party dependencies precisely to keep that surface small.
+- Not domain-specific. The runtime is domain-independent by construction: a
+  static guard in `tests/test_runtime_worker_contract.py` fails the build if any
+  `if worker.name == "sales":` branch appears in `engine.py`. Domains are added
+  as data (`WorkerConfig`) + opt-in `Tool` subclasses, never engine forks. The
+  Sales Worker (`sworker/sales/`) is the first reference implementation; see
+  `docs/BUILDING_A_WORKER.md` to define the next one without touching the core.

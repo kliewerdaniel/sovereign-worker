@@ -35,7 +35,7 @@ import secrets as _secrets
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict
+from typing import Any, Dict, List
 from urllib.parse import urlparse, parse_qs
 
 from .config import default_workspace, get_worker, list_workers
@@ -377,6 +377,60 @@ def render_run(store: WorkerStore, ws, run_id: str, role: str = "") -> str:
         f"<h2>Artifacts</h2><table>{arows or '<tr><td><i>none</i></td></tr>'}</table>"
         f"<h2>Audit trail ({len(audit)} events)</h2><pre class=mono>{_esc(audit_txt)}</pre>"
         f"<p><a href='/'>← back</a></p>"
+    )
+
+
+def render_inspect(store: WorkerStore, ws, run_id: str, role: str = "") -> str:
+    """§39 — concise execution timeline for a run, inspectable by design.
+
+    Mirrors ``cmd_inspect``: RUN -> ACTION -> TOOL -> OBSERVATION -> EVIDENCE ->
+    VERIFICATION -> ARTIFACT -> APPROVAL in one ordered view.
+    """
+    run = store.get("runs", run_id)
+    if not run:
+        return "<h2>Run not found</h2><a href='/'>back</a>"
+    rid = run["id"]
+    steps = store.find("steps", run_id=rid, order="created")
+    actions = store.find("actions", run_id=rid, order="created")
+    obss = store.find("observations", run_id=rid, order="created")
+    evs = store.find("evidence", run_id=rid, order="created")
+    vers = store.find("verifications", run_id=rid, order="created")
+    arts = store.find("artifacts", run_id=rid, order="created")
+    apps = store.find("approvals", run_id=rid, order="created")
+
+    tl: List[tuple] = []
+    for s in steps:
+        tl.append((s.get("created", 0), "STEP",
+                   f"[{_esc(s.get('status', ''))}] {_esc(s.get('description', '')[:70])}"))
+    for a in actions:
+        tl.append((a.get("created", 0), "ACTION",
+                   f"{_esc(a.get('tool', ''))} [{_esc(a.get('risk', ''))}] {_esc(a.get('status', ''))}"))
+    for o in obss:
+        flag = "ok" if o.get("ok") else "FAIL"
+        tl.append((o.get("created", 0), "OBSERVATION", f"{flag} {_esc(o.get('output', '')[:70])}"))
+    for e in evs:
+        tl.append((e.get("created", 0), "EVIDENCE",
+                   f"({_esc(e.get('provenance', ''))}) {_esc(e.get('summary', '')[:70])} <span class=mono>{_esc(e.get('source_ref', ''))}</span>"))
+    for v in vers:
+        tl.append((v.get("created", 0), "VERIFY", f"{_esc(v.get('check', ''))} {_esc(v.get('outcome', ''))}"))
+    for a in arts:
+        tl.append((a.get("created", 0), "ARTIFACT",
+                   f"{_esc(a.get('title', '') or a.get('kind', ''))} <span class=mono>{_esc(a.get('path', ''))}</span>"))
+    for a in apps:
+        tl.append((a.get("created", 0), "APPROVAL",
+                   f"[{_esc(a.get('risk', ''))}] {_esc(a.get('state', ''))} {_esc(a.get('summary', '')[:60])}"))
+    tl.sort(key=lambda t: t[0])
+    rows = "".join(
+        f"<tr><td class='num'>{i:02d}</td><td><span class='pill'>{_esc(k)}</span></td><td>{t}</td></tr>"
+        for i, (_, k, t) in enumerate(tl, 1)
+    )
+    return (
+        f"<h2>Inspect Run #{run['seq']} {_status_pill(run['status'])}</h2>"
+        f"<p style='color:#8a93a3'>worker: <b>{_esc(run['worker'])}</b> · "
+        f"intent: {_esc(run.get('intent', ''))}</p>"
+        f"<p>JSON: <code>python -m sworker inspect {_esc(rid)} --json</code></p>"
+        f"<table class=timeline>{rows}</table>"
+        f"<p><a href='/run?run_id={_esc(rid)}'>full run view →</a> · <a href='/'>← back</a></p>"
     )
 
 
@@ -722,6 +776,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(page("Run", render_run(self._store, self._ws, qs["run_id"][0], role=role)))
             elif url.path == "/why" and qs.get("run_id"):  # §65
                 self._send(page("Why blocked?", render_why(self._store, self._ws, qs["run_id"][0], role=role)))
+            elif url.path == "/inspect" and qs.get("run_id"):  # §39
+                self._send(page("Inspect", render_inspect(self._store, self._ws, qs["run_id"][0], role=role)))
             elif url.path == "/verify" and qs.get("run_id"):
                 self._send(page("Verify", render_verify(self._store, self._ws, qs["run_id"][0])))
             elif url.path == "/api/runs":
@@ -1015,6 +1071,35 @@ def _api_v1_dispatch(handler: "Handler", url: "Any", qs: "dict") -> "tuple[Any, 
         if not run:
             return {"error": "run not found"}, 404
         return run, 200
+    if path.startswith("/inspect/"):  # §39
+        rid = path[len("/inspect/"):]
+        run = store.get("runs", rid)
+        if not run:
+            return {"error": "run not found"}, 404
+        # Same timeline the CLI emits; built directly from store records.
+        def _timeline():
+            tl = []
+            for s in store.find("steps", run_id=rid, order="created"):
+                tl.append((s.get("created", 0), "STEP", f"[{s.get('status','')}] {s.get('description','')[:70]}"))
+            for a in store.find("actions", run_id=rid, order="created"):
+                tl.append((a.get("created", 0), "ACTION", f"{a.get('tool','')} [{a.get('risk','')}] {a.get('status','')}"))
+            for o in store.find("observations", run_id=rid, order="created"):
+                tl.append((o.get("created", 0), "OBSERVATION", f"{'ok' if o.get('ok') else 'FAIL'} {o.get('output','')[:70]}"))
+            for e in store.find("evidence", run_id=rid, order="created"):
+                tl.append((e.get("created", 0), "EVIDENCE", f"({e.get('provenance','')}) {e.get('summary','')[:70]} src={e.get('source_ref','')}"))
+            for v in store.find("verifications", run_id=rid, order="created"):
+                tl.append((v.get("created", 0), "VERIFY", f"{v.get('check','')} {v.get('outcome','')}"))
+            for a in store.find("artifacts", run_id=rid, order="created"):
+                tl.append((a.get("created", 0), "ARTIFACT", f"{a.get('title','') or a.get('kind','')} {a.get('path','')}"))
+            for a in store.find("approvals", run_id=rid, order="created"):
+                tl.append((a.get("created", 0), "APPROVAL", f"[{a.get('risk','')}] {a.get('state','')} {a.get('summary','')[:60]}"))
+            tl.sort(key=lambda t: t[0])
+            return [{"kind": k, "text": t} for _, k, t in tl]
+        return {
+            "id": rid, "seq": run.get("seq"), "worker": run["worker"],
+            "status": run["status"], "intent": run.get("intent", ""),
+            "summary": run.get("summary", ""), "timeline": _timeline(),
+        }, 200
     if path == "/metrics":
         return _metrics.snapshot(), 200
     if path == "/dashboard":

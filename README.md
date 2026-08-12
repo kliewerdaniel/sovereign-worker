@@ -310,7 +310,9 @@ sworker/
   inference.py       model interface (NullInference fallback when no model)
   web.py / web_main.py  local-first web UI + versioned JSON API
   cli.py             command line (all subcommands above)
-  tools/
+  sales/             Sales Worker boundary layer (reference impl of the
+                     runtime/worker boundary — adds a 2nd domain via WorkerConfig
+                     + opt-in tools, NOT engine forks)
     base.py          Tool / ToolContext / risk floor / subprocess tracking
     fs.py            file read/list/write (root-bounded)
     exec.py          shell.exec + python analysis (resource-timeout bounded)
@@ -363,6 +365,8 @@ deploying a worker that can reach the network or push to a remote, then
 | `docs/PROCEDURES.md` | procedure publish/rollback + web review ledger (§23) |
 | `docs/INTEGRATION_TESTS.md` | end-to-end integration test suite (§68) |
 | `docs/OPERATIONS.md` | operations runbook + deployment (Docker) |
+| `docs/SALES_INTEGRATION.md` | Sales Worker integration design + the runtime/worker boundary proof |
+| `docs/BUILDING_A_WORKER.md` | how to add a 3rd domain worker without touching the engine |
 | `docs/DEMO.md` | demo walkthrough |
 
 ---

@@ -25,6 +25,20 @@ REQUEST ─▶ INTENT ─▶ PLAN ─▶ ACTION ─▶ TOOL ─▶ OBSERVATION �
 - **Store**: a local SQLite ledger with a hash chain (`verify_audit_chain()`)
   so tampering with any past record breaks the chain.
 
+> **Runtime vs Worker (the core abstraction).** The platform is *one runtime* and
+> *many workers*. The runtime owns planning, execution, permissions, tool dispatch,
+> observations, evidence, verification, artifacts, approval, persistence, replay, and
+> audit — **none of it branches on worker identity**. A worker is a pure data object
+> (`WorkerConfig`): an identity plus a policy plus a tool allow-list plus a knowledge
+> scope plus procedures plus a domain config. To add the Sales Worker we defined a new
+> `WorkerConfig` instance and a boundary-layer package (`sworker/sales/`); **zero lines
+> of the engine were changed for the domain**. A static guard in
+> `tests/test_runtime_worker_contract.py` fails the build if anyone sneaks a
+> `if worker.name == "sales":` branch into `engine.py`. The Sales Worker is the
+> *first reference implementation* of this boundary — see `docs/BUILDING_A_WORKER.md`
+> to define the next one (a Research Worker, a Finance Worker, …) without touching
+> the core.
+
 ---
 
 ## 2. Trust boundaries (fail-closed everywhere)

@@ -101,3 +101,9 @@ and approval buttons.
 | Tamper-evident history | hash-chain audit ledger (`store.verify_audit_chain`) |
 | Fail-closed classification | static AST risk classifier |
 | Secrets never in model context | connector resolver returns logical names only |
+
+The `analyst` worker here is a core-tool-only worker. The same runtime also drives
+the Sales Worker (`sworker sales daily-run`) — two different domains, one engine,
+**zero engine code branched on worker identity** (guarded by
+`tests/test_runtime_worker_contract.py`). To build a third domain without forking
+the engine, see `docs/BUILDING_A_WORKER.md`.
