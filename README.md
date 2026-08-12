@@ -1,22 +1,84 @@
 # Sovereign AI Worker — `sworker`
 
-A **local-first AI worker platform**. An "AI employee" you give a YAML identity,
-a set of tools, and a permission policy. It executes real work against your
-local files (no cloud, no model API required to run), records every step in an
-append-only audit log, and **never states a number it didn't derive** — every
-figure a run produces is independently re-verified from source data.
+A **local-first AI worker runtime**. One engine, many workers: you give a worker a
+YAML identity, a set of tools, and a permission policy, and the runtime executes real
+work against your local files, records every step in an append-only audit log, and
+**never states a number it didn't derive**.
+
+The **Sales Worker** documented below is *one instance* of this runtime — not a
+bolted-on vertical. The same engine runs an analyst worker, a research worker, or your
+own domain; the sales layer adds a worker identity + 16 opt-in tools and changes **zero
+engine code** (a contract test guards that). If you want to see the whole pattern, read
+[`docs/BUILDING_A_WORKER.md`](docs/BUILDING_A_WORKER.md) — it defines a *different*
+domain without touching the engine at all.
 
 ```
 REQUEST → INTENT → PLAN → ACTION → TOOL → OBSERVATION → EVIDENCE →
 VERIFICATION → ARTIFACT → APPROVAL → FINAL → AUDIT
 ```
 
-Verified on **Python 3.14.6** (Homebrew, `/opt/homebrew/bin/python3.14`). Core
-has **zero third-party dependencies**; the only optional dep is
+Verified on **Python 3.14.6** (Homebrew, `/opt/homebrew/bin/python3.14`). Core has
+**zero third-party dependencies**; the only optional dep is
 [Hermes Atlas](https://github.com/NousResearch/hermes-atlas) for *compiled*
 company-knowledge retrieval (it degrades to labelled grep without it).
 
+> **The substrate / instance framing.** `sworker` is the *substrate*: an engine that
+> plans, executes, classifies risk, records evidence, and verifies — and **never
+> branches on what kind of worker it is running**. A *worker* (analyst, researcher,
+> sales) is an *instance* of that substrate: a config plus tools plus a policy. This
+> separation is the project's core abstraction, and it is enforced by a static guard
+> in the test suite — a worker-specific `if` in `engine.py` fails the build.
+
 ---
+
+## What it guarantees vs. what it doesn't
+
+**Guaranteed (mechanically, in code):**
+- **Evidence is real.** `EvidenceLedger` / `SalesEvidence` mint evidence only from
+  actual tool observations, each carrying a `source_ref` (file + sha256). A claim with
+  no `source_ref` cannot enter the ledger.
+- **Every stated number is re-derived.** After execution, derived figures
+  (`data.query` aggregates, `sales_score_recomputes`, `sales_metrics_match_ledger`) are
+  re-summed against source rows. A mismatch downgrades the run to `PARTIAL_SUCCESS` —
+  it does not keep the nicer number.
+- **Unrecognized code/commands escalate.** `python.run` is classified by walking the
+  real `ast` import/call graph; any import/call the walker can't positively recognise
+  (or a dynamic `eval`/`exec`/`__import__` with a non-literal arg) escalates to the
+  **highest risk tier the tool can reach**, never the safe floor. Same for
+  `shell.exec` network pipes.
+- **A denied action can't be reassembled.** `DecompositionGuard` remembers a risk ceiling
+  a human rejected and blocks any equal-or-higher-risk action that shows up later — so
+  "send the email" refused can't be reached via "write it to a file" → "shell: sendmail".
+
+**Not guaranteed (be honest about the boundary):**
+- **Semantic judgments aren't certified true.** A qualification *score* is deterministically
+  computed and re-derived, but the *truth* of a pain-point or fit claim is only as good
+  as the source it cites. The guarantee is on the **evidence trail**, not on the
+  semantic claim.
+- **AST classification + allowlisting reduce risk; they are not a sandbox.** They catch a
+  broad class of egress/destruction statically, but this is not a container. Don't point a
+  worker at an untrusted host and call it isolated.
+- **Degradation is recorded, not hidden.** When a safety-critical capability (model,
+  knowledge index, sandbox) is missing, the run records a *degradation* and may downgrade
+  `SUCCESS` → `PARTIAL_SUCCESS` rather than pretending all is well.
+
+### Guarantee-mapping table
+
+For each question a reviewer asks, which existing subsystem answers it:
+
+| You ask… | Answered by | How to see it |
+|---|---|---|
+| Who authorized this? | `permissions.py` + `approvals.py` | `sworker inspect <run_id>` shows `[risk]` per action; approvals in `audit` |
+| What did it read? | `evidence.py` (`source_ref`) | `inspect` EVIDENCE lines; `sworker sales lead <id>` `evidence` field |
+| What did it do? | `store.py` (actions + audit) | `sworker inspect <run_id>` ACTION/OBSERVATION lines |
+| Where did this number come from? | `verify.py` (recompute checks) | `sworker verify <run_id>`; `sales_metrics_match_ledger` |
+| Can I reproduce it? | `store.py` audit hash-chain | `sworker replay <run_id>` (no model needed) |
+| Why was this allowed? | `permissions.py` (policy + risk floor) | `why <run_id>` aggregation |
+| What if the model is wrong? | `verify.py` + `degradation.py` | `recompute_*` fail → `PARTIAL_SUCCESS`; degradation logged |
+
+A full, screenshot-worthy Sales Worker walkthrough lives in
+[`docs/SALES_DEMO.md`](docs/SALES_DEMO.md); the analyst-worker demo is in
+[`docs/DEMO.md`](docs/DEMO.md).
 
 ## Why it's built this way
 
@@ -377,6 +439,7 @@ deploying a worker that can reach the network or push to a remote, then
 | `docs/INTEGRATION_TESTS.md` | end-to-end integration test suite (§68) |
 | `docs/OPERATIONS.md` | operations runbook + deployment (Docker) |
 | `docs/SALES_INTEGRATION.md` | Sales Worker integration design + the runtime/worker boundary proof |
+| `docs/SALES_DEMO.md` | recorded end-to-end sales walkthrough (inspect/audit/replay) + limitations |
 | `docs/BUILDING_A_WORKER.md` | how to add a 3rd domain worker without touching the engine |
 | `docs/DEMO.md` | demo walkthrough |
 
