@@ -235,7 +235,7 @@ persisted run/evidence/artifact/verification records. No mocks, no cloud.
 ```bash
 cd sovereign-worker
 env -u PYTHONPATH -u PYTHONHOME /opt/homebrew/bin/python3.14 -m pytest tests/ -q
-# 443 passed
+# 485 passed
 ```
 
 Coverage spans every subsystem (engine lifecycle, state machine, tenant
@@ -310,19 +310,30 @@ sworker/
   inference.py       model interface (NullInference fallback when no model)
   web.py / web_main.py  local-first web UI + versioned JSON API
   cli.py             command line (all subcommands above)
-  sales/             Sales Worker boundary layer (reference impl of the
-                     runtime/worker boundary — adds a 2nd domain via WorkerConfig
-                     + opt-in tools, NOT engine forks)
-    base.py          Tool / ToolContext / risk floor / subprocess tracking
-    fs.py            file read/list/write (root-bounded)
-    exec.py          shell.exec + python analysis (resource-timeout bounded)
-    data.py          query / inspect (CSV + derived verifications)
-    http.py          http.get / http.post (network-category, egress-guarded)
-    git.py           git operations (egress-guarded)
-    browser.py       browser tool (allowlist + timeout)
-    message.py       messaging (allowlist + rate-limit)
-    knowledge.py     knowledge.search (Atlas bridge)
-    sandbox.py       execution isolation (none / docker)
+  sales/             Sales Worker boundary layer — reference impl of the
+                     runtime/worker boundary. Adds a 2nd domain via WorkerConfig
+                     + opt-in Tool subclasses + 15-stage pipeline; NO engine forks.
+                     Reads DailySalesOS markdown (read-only source of truth) and
+                     projects it into an additive extension of Experiment_Ledger.
+    models.py        sales dataclasses (Lead, ICP, Evidence, PipelineStage…)
+    schema.py        additive DDL stubs (never drops/alters ledger tables)
+    repository.py    SalesRepository — single ledger writer + read-only raw()
+    pipeline.py      15-stage PipelineStage enum + can_move transition guard
+    qualification.py deterministic lead scoring (refuses no-evidence leads)
+    evidence.py      SalesEvidence (real observations only, source_ref attached)
+    knowledge.py     parses DailySalesOS markdown → ontology (incl. daily targets)
+    discovery.py     candidate ingest (dedupe) from CSV
+    research.py      local-only lead research + pain/signal extraction
+    outreach.py      draft/approve/record-sent (external egress gated approve)
+    followup.py      follow-up scheduling per stage rule (idempotent)
+    metrics.py       daily_report vs documented targets + markdown render
+    checks.py        5 sales @check hooks (recompute/evidence/approval/legal/ledger)
+    tools/base.py     16 sales_* Tool subclasses (opt-in via build_registry())
+    templates/       worker YAMLs (sales_researcher/outreach/analyst) +
+                     DAILY_RESEARCH.yaml / DAILY_SALES_RUN.yaml procedures
+    cli.py           `sworker sales ...` (init/seed/icp/pipeline/lead/metrics/
+                     verify/templates/daily-run)
+    web.py           /api/v1/sales + /sales page (shares the core web engine)
 ```
 
 **Design commitments:** local-first, no cloud APIs; the model proposes and the
@@ -349,7 +360,7 @@ deploying a worker that can reach the network or push to a remote, then
 
 | doc | what it covers |
 |---|---|
-| `docs/ROADMAP.md` | the §-numbered plan + progress tracker (all phases complete; 443 passed) |
+| `docs/ROADMAP.md` | the §-numbered plan + progress tracker (all phases complete; 485 passed) |
 | `docs/ARCHITECTURE.md` | system architecture overview + cross-links to every subsystem |
 | `docs/SECURITY.md` | honest security model, limits, fail-closed contract |
 | `docs/THREAT_MODEL.md` | 10 adversary classes mapped to real modules/symbols/tests (§51) |
