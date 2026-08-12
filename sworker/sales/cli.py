@@ -22,6 +22,7 @@ from .repository import SalesRepository, default_ledger_path, SalesError
 from . import knowledge as sales_knowledge
 from . import metrics as sales_metrics
 from . import checks as sales_checks  # noqa: F401  (imports register the @check hooks)
+from . import discovery as D, evidence as E, followup as F, qualification as Q, research as R, outreach as O
 
 
 def _repo() -> SalesRepository:
@@ -167,7 +168,7 @@ def cmd_pipeline(args) -> int:
         if args.summary:
             rows = repo.pipeline_summary()
         else:
-            rows = [l.to_dict() for l in repo.search_leads(stage=args.stage or "")]
+            rows = [l for l in repo.search_leads(stage=args.stage or "")]
     finally:
         repo.close()
     _jprint(rows)
@@ -192,6 +193,108 @@ def cmd_lead(args) -> int:
     finally:
         repo.close()
     _jprint(out)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# lead discover / research / qualify — thin operators over the same functions
+# the worker procedures (and sales_* tools) call. No logic is duplicated here.
+# --------------------------------------------------------------------------- #
+def cmd_lead_discover(args) -> int:
+    repo = _repo()
+    try:
+        acc = E.SalesEvidence(repo)
+        if args.source == "prospects":
+            candidates, source_ref = D.candidates_from_prospects(repo)
+        else:
+            path = os.path.join("company", args.source)
+            if not os.path.isfile(os.path.join(default_workspace().root, path)):
+                path = args.source
+            candidates, source_ref = D.read_candidates(path)
+        res = D.discover(repo, candidates, source_ref=source_ref, source=args.source,
+                         limit=args.limit, run_id="cli", evidence=acc)
+        print(f"discovered {res['created_count']} new; {res['duplicate_count']} dup; "
+              f"{res['rejected_count']} rejected")
+    finally:
+        repo.close()
+    return 0
+
+
+def cmd_lead_research(args) -> int:
+    repo = _repo()
+    try:
+        acc = E.SalesEvidence(repo)
+        root = _sales_docs_root()
+        sources = args.sources or ([f"company/{n}" for n in os.listdir(root)]
+                                   if root else [])
+        res = R.research_lead(repo, args.lead_id, sources, evidence=acc, run_id="cli")
+        print(f"{res['evidence_count']} evidence; {len(res['pain_points'])} pain point(s)")
+    finally:
+        repo.close()
+    return 0
+
+
+def cmd_lead_qualify(args) -> int:
+    repo = _repo()
+    try:
+        q = Q.evaluate(repo, args.lead_id, run_id="cli")
+        print(f"{q.lead_id}: score {q.score} ({q.tier.value}) v{q.version}")
+    finally:
+        repo.close()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# outreach draft / approve — thin operators over outreach.prepare / approve_draft.
+# --------------------------------------------------------------------------- #
+def cmd_outreach_draft(args) -> int:
+    repo = _repo()
+    try:
+        offer = sales_knowledge.parse_core_offer(_sales_docs_root())
+        seqs = sales_knowledge.parse_followup_sequences(_sales_docs_root())
+        res = O.prepare(repo, args.lead_id, sequences=seqs, offer=offer,
+                        channel=args.channel, run_id="cli")
+        print(f"drafted; requires_approval={res['requires_approval']}; "
+              f"draft_id={res['draft'].get('id')}")
+    finally:
+        repo.close()
+    return 0
+
+
+def cmd_outreach_approve(args) -> int:
+    repo = _repo()
+    try:
+        draft = repo.approve_draft(args.draft_id, args.approved_by)
+        print(f"approved {draft.id} by {args.approved_by}")
+    except Exception as exc:
+        print(f"approve failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        repo.close()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# followups due / schedule — thin operators over followup.due_today / schedule_for_lead
+# --------------------------------------------------------------------------- #
+def cmd_followups_due(args) -> int:
+    repo = _repo()
+    try:
+        out = F.due_today(repo, on=args.on)
+    finally:
+        repo.close()
+    _jprint(out)
+    return 0
+
+
+def cmd_followups_schedule(args) -> int:
+    repo = _repo()
+    try:
+        seqs = sales_knowledge.parse_followup_sequences(_sales_docs_root())
+        res = F.schedule_for_lead(repo, args.lead_id, sequences=seqs, run_id="cli")
+        print(f"lead {args.lead_id}: created={res['created']} ({res.get('reason', '')})")
+    finally:
+        repo.close()
     return 0
 
 
@@ -390,9 +493,42 @@ def build_subparser(sub) -> None:
     p.add_argument("--summary", action="store_true")
     p.set_defaults(func=cmd_pipeline)
 
-    p = sales_sub.add_parser("lead", help="show one lead's full record")
-    p.add_argument("lead_id")
-    p.set_defaults(func=cmd_lead)
+    p = sales_sub.add_parser("lead", help="lead operations: show / discover / research / qualify")
+    lead_sub = p.add_subparsers(dest="lsub", required=True)
+    lp = lead_sub.add_parser("show", help="full record for one lead")
+    lp.add_argument("lead_id")
+    lp.set_defaults(func=cmd_lead)
+    lp = lead_sub.add_parser("discover", help="ingest candidates from a CSV/prospects")
+    lp.add_argument("source", help="candidate CSV under company/ or 'prospects'")
+    lp.add_argument("--limit", type=int, default=0)
+    lp.set_defaults(func=cmd_lead_discover)
+    lp = lead_sub.add_parser("research", help="research one lead from permitted docs")
+    lp.add_argument("lead_id")
+    lp.add_argument("--sources", nargs="*", default=[])
+    lp.set_defaults(func=cmd_lead_research)
+    lp = lead_sub.add_parser("qualify", help="score one lead deterministically")
+    lp.add_argument("lead_id")
+    lp.set_defaults(func=cmd_lead_qualify)
+
+    p = sales_sub.add_parser("outreach", help="outreach operations: draft / approve")
+    out_sub = p.add_subparsers(dest="osub", required=True)
+    op = out_sub.add_parser("draft", help="draft outreach for one lead (needs approval to send)")
+    op.add_argument("lead_id")
+    op.add_argument("--channel", default="email")
+    op.set_defaults(func=cmd_outreach_draft)
+    op = out_sub.add_parser("approve", help="approve a draft for sending")
+    op.add_argument("draft_id")
+    op.add_argument("--approved-by", default="operator")
+    op.set_defaults(func=cmd_outreach_approve)
+
+    p = sales_sub.add_parser("followups", help="follow-up operations: due / schedule")
+    fu_sub = p.add_subparsers(dest="fsub", required=True)
+    fp = fu_sub.add_parser("due", help="today's follow-ups + SLA-overdue leads")
+    fp.add_argument("--on", default="")
+    fp.set_defaults(func=cmd_followups_due)
+    fp = fu_sub.add_parser("schedule", help="schedule documented next action for a lead")
+    fp.add_argument("lead_id")
+    fp.set_defaults(func=cmd_followups_schedule)
 
     p = sales_sub.add_parser("metrics", help="daily sales report vs documented targets")
     p.add_argument("--day", default="")
